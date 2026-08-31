@@ -17,6 +17,10 @@ jobs:
             dockerfile: docker/Dockerfile
           - tag: hy3d21
             dockerfile: hy3d21/Dockerfile
+          - tag: trellis2
+            dockerfile: trellis2/Dockerfile
+          - tag: pixal3d
+            dockerfile: pixal3d/Dockerfile
     steps:
       - name: Free disk space (big ML images need room)
         run: |

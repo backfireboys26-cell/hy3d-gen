@@ -118,7 +118,9 @@ class ShapeWorker:
             torch.cuda.empty_cache()
 
         save_path = os.path.join(SAVE_DIR, f"{uid}.glb")
-        mesh.export(save_path)
+        tmp_path = save_path + ".tmp.glb"
+        mesh.export(tmp_path)
+        os.replace(tmp_path, save_path)  # /status sees the file only when it is whole
         return save_path
 
 
