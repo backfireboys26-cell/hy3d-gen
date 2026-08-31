@@ -1,0 +1,57 @@
+# =============================================================================
+# requirements-frozen.txt  --  FROZEN Pascal-safe core
+#   Rig: 2x GTX 1070 (GP104 / sm_61 / 8 GB), i7-7700, 64 GB, Win11, Python 3.12
+#   Driver 560.94 (Windows 32.0.15.8094), CUDA 12.6 -- fully supports sm_61
+# -----------------------------------------------------------------------------
+# This file is TWO things:
+#   1. The canonical record of the frozen versions (read it, cite it).
+#   2. A pip CONSTRAINTS file. Pass it with -c when installing any downstream
+#      repo so no dependency can silently move torch / numpy:
+#          pip install -r requirements.txt -c C:\ai3d\requirements-frozen.txt
+#      (As a constraint it only fixes versions of things being installed; it
+#      pulls nothing, so no index directive is needed here.)
+#
+# HOW TO INSTALL THE CORE:
+#   Use INSTALL_AI3D.bat. It installs numpy from PyPI first, then the torch
+#   stack from the cu124 index (below). xformers is intentionally NOT part of
+#   the core (see the OPTIONAL note below). Do NOT try to install the torch
+#   lines with a bare 'pip install -r' -- you MUST pass the cu124 index
+#   explicitly or pip serves the Pascal-breaking cu130 wheels:
+#
+#   INDEX-URL (the ONLY correct source for the torch stack on Pascal):
+#     --index-url https://download.pytorch.org/whl/cu124
+#     # cu124 legacy wheels still carry sm_61 SASS. NEVER install torch from
+#     # PyPI -- PyPI now serves cu130, which has ZERO Pascal kernels.
+# =============================================================================
+
+numpy==1.26.4            # numpy-1 ABI. numpy 2 breaks pymeshlab / torchmcubes / older trimesh. Arch-neutral stability pin.
+torch==2.5.1             # cu124 wheel ships sm_61 SASS -> runs on GP104. Last stack before cu130-only wheels. FROM cu124 index.
+torchvision==0.20.1      # canonical partner of torch 2.5.1 (cu124); sm_61 present. FROM cu124 index.
+torchaudio==2.5.1        # canonical partner of torch 2.5.1 (cu124); kept for stack completeness / diffusers audio paths. FROM cu124 index.
+
+# --- OPTIONAL (NOT part of the core; NOT installed by default) ----------------
+# xformers is NOT required by TripoSR or Hunyuan3D-2GP and is deliberately kept
+# OUT of the frozen core: an unverified xformers wheel is the exact Pascal
+# landmine ("no kernel image is available") this stack exists to avoid, and a
+# bare 'import xformers' proves nothing. IF (and only if) a specific tool ever
+# needs it, the ONLY sanctioned build is:
+#     xformers==0.0.29.post1   # hard-pins torch==2.5.1; last build shipping sm_61. FROM cu124 index.
+# and it MUST then be validated by verify_torch_pascal.py, which RUNS a real
+# xformers.ops.memory_efficient_attention on cuda:0 and HARD-FAILS (non-zero
+# exit) if the sm_61 kernel image is missing.
+#
+# --- DO NOT ADD (see STACK_POLICY.md) ----------------------------------------
+# flash-attn             # kernels are sm_80+ only -> architecturally impossible on sm_61. Never install, never enable.
+# xformers>=0.0.30       # drops Pascal SASS/PTX. Hard ceiling (if used at all) is 0.0.29.post1.
+# torch  (from PyPI)     # PyPI default is cu130 = zero Pascal kernels.
+# anything requiring bf16 or sm_80  # GP104 has no bf16 and no usable tensor cores.
+#
+# --- Pascal fp16 note ---------------------------------------------------------
+# fp16 MATH on GP104 runs at ~1/64 the fp32 rate. fp16 is a STORAGE win (halves
+# VRAM) but often a compute LOSS. Benchmark fp16 vs fp32 per model; don't assume.
+#
+# --- Build-time env for compiled CUDA extensions ------------------------------
+# Any extension you compile later (Hunyuan custom_rasterizer / differentiable_
+# renderer, TripoSR torchmcubes, pointnet2_ops) must target Pascal. Set BEFORE
+# building (INSTALL_AI3D.bat already persists it user-wide via setx):
+#     set TORCH_CUDA_ARCH_LIST=6.1+PTX

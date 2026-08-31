@@ -1,0 +1,136 @@
+diff --git a/api_server.py b/api_server.py
+index b64e698..d93c4c3 100644
+--- a/api_server.py
++++ b/api_server.py
+@@ -206,7 +206,9 @@ class ModelWorker:
+             params['octree_resolution'] = params.get("octree_resolution", 128)
+             params['num_inference_steps'] = params.get("num_inference_steps", 5)
+             params['guidance_scale'] = params.get('guidance_scale', 5.0)
+-            params['mc_algo'] = 'dmc'
++            # 'mc' (skimage marching cubes) on this rig: 'dmc' needs the diso CUDA extension,
++            # which is not installed (no nvcc; Pascal sm_61 box). Overridable per-request.
++            params['mc_algo'] = params.get('mc_algo', 'mc')
+             import time
+             start_time = time.time()
+             mesh = self.pipeline(**params)[0]
+@@ -219,11 +221,17 @@ class ModelWorker:
+             mesh = self.pipeline_tex(mesh, image)
+ 
+         type = params.get('type', 'glb')
+-        with tempfile.NamedTemporaryFile(suffix=f'.{type}', delete=True) as temp_file:
+-            mesh.export(temp_file.name)
+-            mesh = trimesh.load(temp_file.name)
+-            save_path = os.path.join(SAVE_DIR, f'{str(uid)}.{type}')
+-            mesh.export(save_path)
++        # Windows: NamedTemporaryFile(delete=True) keeps the file open/locked, so trimesh's
++        # own open() on the same path fails with PermissionError. Use a closed temp path.
++        fd, tmp_path = tempfile.mkstemp(suffix=f'.{type}')
++        os.close(fd)
++        try:
++            mesh.export(tmp_path)
++            mesh = trimesh.load(tmp_path)
++        finally:
++            os.remove(tmp_path)
++        save_path = os.path.join(SAVE_DIR, f'{str(uid)}.{type}')
++        mesh.export(save_path)
+ 
+         torch.cuda.empty_cache()
+         return save_path, uid
+@@ -274,12 +282,34 @@ async def generate(request: Request):
+         return JSONResponse(ret, status_code=404)
+ 
+ 
++# --- LOCAL PATCH (2026-08-25): honest async failure reporting ---
++# /send ran worker.generate in a raw thread with NO exception capture, and /status inferred
++# state solely from "does the output .glb exist yet?". A worker crash (e.g. the FlashVDM
++# IndexError on empty occupancy) therefore left /status returning 'processing' FOREVER, so the
++# only downstream failure detector was generate3d.py's per-candidate wall-clock timeout - a
++# crashed seed silently burned the full --timeout-s (420s). Record terminal error state here so
++# /status can return {status:error} the instant the worker thread dies; generate3d.poll() already
++# handles status=='error' and fails the seed in seconds. Success is still detected by the file,
++# so the happy path is unchanged.
++JOB_ERRORS = {}                    # uid(str) -> {"status":"error", "error": "<Type: msg>"}
++JOB_ERRORS_LOCK = threading.Lock()
++
++
++def _run_generate(uid, params):
++    try:
++        worker.generate(uid, params)
++    except Exception as e:
++        logger.error("generate worker crashed for uid %s:\n%s", uid, traceback.format_exc())
++        with JOB_ERRORS_LOCK:
++            JOB_ERRORS[str(uid)] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
++
++
+ @app.post("/send")
+ async def generate(request: Request):
+     logger.info("Worker send...")
+     params = await request.json()
+     uid = uuid.uuid4()
+-    threading.Thread(target=worker.generate, args=(uid, params,)).start()
++    threading.Thread(target=_run_generate, args=(uid, params,)).start()
+     ret = {"uid": str(uid)}
+     return JSONResponse(ret, status_code=200)
+ 
+@@ -287,14 +317,16 @@ async def generate(request: Request):
+ @app.get("/status/{uid}")
+ async def status(uid: str):
+     save_file_path = os.path.join(SAVE_DIR, f'{uid}.glb')
+-    print(save_file_path, os.path.exists(save_file_path))
+-    if not os.path.exists(save_file_path):
+-        response = {'status': 'processing'}
+-        return JSONResponse(response, status_code=200)
+-    else:
++    if os.path.exists(save_file_path):
+         base64_str = base64.b64encode(open(save_file_path, 'rb').read()).decode()
+         response = {'status': 'completed', 'model_base64': base64_str}
+         return JSONResponse(response, status_code=200)
++    with JOB_ERRORS_LOCK:
++        err = JOB_ERRORS.get(str(uid))
++    if err is not None:
++        return JSONResponse(err, status_code=200)
++    response = {'status': 'processing'}
++    return JSONResponse(response, status_code=200)
+ 
+ 
+ if __name__ == "__main__":
+@@ -306,11 +338,14 @@ if __name__ == "__main__":
+     parser.add_argument("--device", type=str, default="cuda")
+     parser.add_argument("--limit-model-concurrency", type=int, default=5)
+     parser.add_argument('--enable_tex', action='store_true')
++    parser.add_argument('--subfolder', type=str, default='hunyuan3d-dit-v2-mini-turbo',
++                        help="dit subfolder: hunyuan3d-dit-v2-mini-turbo (5-step distill, default) "
++                             "or hunyuan3d-dit-v2-mini (NON-turbo, more steps -> more real detail)")
+     args = parser.parse_args()
+     logger.info(f"args: {args}")
+ 
+     model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
+ 
+     worker = ModelWorker(model_path=args.model_path, device=args.device, enable_tex=args.enable_tex,
+-                         tex_model_path=args.tex_model_path)
+-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
++                         tex_model_path=args.tex_model_path, subfolder=args.subfolder)
++    uvicorn.run(app, host=args.host, port=int(args.port), log_level="info")
+diff --git a/hy3dgen/shapegen/models/autoencoders/volume_decoders.py b/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
+index d7bfd84..0afbff1 100644
+--- a/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
++++ b/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
+@@ -396,6 +396,18 @@ class FlashVDMVolumeDecoding:
+                            torch.tensor(bbox_min, dtype=torch.float32, device=device))
+ 
+             query_grid_num = 6
++            # LOCAL PATCH (2026-08-25): a degenerate diffusion result leaves this octree level with
++            # NO near-surface voxels, so next_points is empty and next_points.min(axis=0) dies with
++            # "IndexError: min(): Expected reduction dim 0 to have non-zero size". Raised inside the
++            # /send worker thread that was invisible to /status, so it only surfaced downstream as a
++            # 420s client timeout - the "ran 15 min, produced nothing" symptom. Fail loudly and
++            # specifically: the server records it (JOB_ERRORS) and generate3d fails the seed in
++            # seconds with a real reason, leaving the non-degenerate seeds to succeed.
++            if next_points.shape[0] == 0:
++                raise RuntimeError(
++                    f"degenerate generation: no surface voxels at octree level {octree_depth_now} "
++                    "(empty occupancy) - the diffusion produced no extractable shape for this seed; "
++                    "try another seed, higher guidance_scale, or a cleaner/larger input crop")
+             min_val = next_points.min(axis=0).values
+             max_val = next_points.max(axis=0).values
+             vol_queries_index = (next_points - min_val) / (max_val - min_val) * (query_grid_num - 0.001)

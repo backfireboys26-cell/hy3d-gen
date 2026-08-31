@@ -1,0 +1,39 @@
+# requirements-pascal.txt - upstream requirements.txt minus `diso` (source-only CUDA build,
+# needs nvcc; not installed on this rig). The shape pipeline runs with mc_algo='mc' instead,
+# which needs scikit-image (added below). Install with the frozen constraint lock:
+#   pip install -r requirements-pascal.txt -c C:\ai3d\requirements-frozen.txt
+gradio_litmodel3d
+ninja
+pybind11
+
+diffusers==0.32.2  # newest diffusers imports Qwen3ForCausalLM, absent from the pinned transformers 4.49.0
+einops
+opencv-python
+numpy
+torch
+transformers==4.49.0
+torchvision
+
+omegaconf
+tqdm
+
+# Mesh Processing
+trimesh
+pymeshlab
+pygltflib
+xatlas
+
+# Training
+accelerate
+
+# Demo only
+gradio
+uvicorn
+fastapi
+mmgp==3.2.7
+rembg
+onnxruntime
+pydantic==2.10.6
+
+# mc surface extractor (replaces diso/dmc on this rig)
+scikit-image
