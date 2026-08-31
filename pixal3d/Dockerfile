@@ -55,15 +55,21 @@ RUN pip install --index-url https://download.pytorch.org/whl/cu126 \
 # natten prebuilt wheel matched to torch 2.7.0 + cu126 (README step 3, minus the build)
 RUN pip install natten==0.21.0+torch270cu126 -f https://whl.natten.org
 
-# Pixal3D's requirements.txt pins + the contract server's, then MoGe (pinned) and
-# LAST their exact utils3d wheel (README step 4) so it wins over whatever utils3d
-# revision MoGe's own dependency list dragged in.
+# Pixal3D's requirements.txt pins + the contract server's. MoGe installs --no-deps:
+# its dependency list drags in a DIFFERENT FlexGEMM git pin (a CUDA source build that
+# would fire inside pip build isolation, without torch), gradio 6, matplotlib and a
+# 'pipeline' package - none needed for the moge.model.v2 import path this server uses;
+# its vendored utils3d_moge ships alongside (also --no-deps) so MoGe never touches
+# Pixal3D's utils3d. LAST, Pixal3D's exact utils3d wheel (README step 4) wins the
+# `utils3d` name.
 RUN pip install pillow==12.0.0 imageio==2.37.2 imageio-ffmpeg==0.6.0 tqdm==4.67.1 \
         easydict==1.13 opencv-python-headless==4.12.0.88 trimesh==4.10.1 \
         transformers==4.57.3 zstandard==0.25.0 kornia==0.8.2 timm==1.0.22 \
         diffusers==0.37.1 accelerate==1.13.0 plyfile==1.1.3 scipy \
         fastapi uvicorn \
-    && pip install git+https://github.com/microsoft/MoGe.git@${MOGE_REF} \
+    && pip install --no-deps \
+        git+https://github.com/microsoft/MoGe.git@${MOGE_REF} \
+        git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37 \
     && pip install --force-reinstall --no-deps \
         https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl
 

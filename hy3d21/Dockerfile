@@ -33,6 +33,11 @@ WORKDIR /app
 RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git /app \
     && git -C /app checkout ${HY3D21_REF}
 
+# python:3.10-slim ships a pip old enough to trip over PEP-503 name normalization on
+# the pytorch index (typing_extensions wheel rejected -> sdist -> flit_core missing
+# from that index). Modern pip takes the wheel. (Round-1 CI failure.)
+RUN pip install --upgrade pip setuptools wheel
+
 # torch first from the cu124 index (README-tested stack: 2.5.1+cu124), then the
 # shape-only requirement set with the repo's own version pins carried over.
 COPY hy3d21/requirements.txt /tmp/requirements-hy3d21.txt
