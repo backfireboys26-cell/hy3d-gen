@@ -36,14 +36,25 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Every build gets an IMMUTABLE tag (<lane>-<utc date>-<short sha>) next to the floating
+      # lane tag, so an endpoint can be pinned to one exact build and a rollback is a tag name,
+      # not an archaeology of digests. The floating tag keeps moving for the bake-off lanes.
+      - name: Immutable tag
+        id: meta
+        run: echo "immutable=${{ matrix.tag }}-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/hy3d-gen:${{ matrix.tag }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/hy3d-gen:${{ matrix.tag }}
+            ghcr.io/${{ github.repository_owner }}/hy3d-gen:${{ steps.meta.outputs.immutable }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
       - name: Report
-        run: echo "pushed ghcr.io/${{ github.repository_owner }}/hy3d-gen:${{ matrix.tag }}"
+        run: |
+          echo "pushed ghcr.io/${{ github.repository_owner }}/hy3d-gen:${{ matrix.tag }}"
+          echo "pushed ghcr.io/${{ github.repository_owner }}/hy3d-gen:${{ steps.meta.outputs.immutable }}  (immutable)"

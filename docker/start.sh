@@ -25,6 +25,54 @@ mkdir -p "${HF_ROOT}"
 export U2NET_HOME="${U2NET_HOME:-${HF_ROOT}/u2net}"
 mkdir -p "${U2NET_HOME}"
 
+# HF offline mode, self-proving (audit 2026-09-02, endpoint hygiene "HF_HUB_OFFLINE=1 only if
+# the volume is proven complete"): go offline ONLY when every hub file the loader will open is
+# already in the cache - the dit subfolder's config.yaml + model.fp16.safetensors and the turbo
+# VAE the pipeline swaps in (enable_flashvdm), both under the repo's refs/main snapshot. Then
+# huggingface_hub / transformers never touch huggingface.co at boot: no per-file HEAD calls, no
+# dependence on the hub being up. Anything missing -> stay online and SAY which path, so a fresh
+# volume still self-populates. An operator-set HF_HUB_OFFLINE (0 or 1) always wins. The image
+# encoder is built from the config inline in config.yaml (no hub repo), rembg's u2net comes
+# from GitHub via U2NET_HOME (not an HF call) - so these two paths are the whole hub surface.
+case "${MODEL_PATH##*/}" in
+    Hunyuan3D-2|Hunyuan3D-2mv) VAE_REPO="tencent/Hunyuan3D-2";     VAE_SUBFOLDER="hunyuan3d-vae-v2-0-turbo" ;;
+    Hunyuan3D-2mini)           VAE_REPO="tencent/Hunyuan3D-2mini"; VAE_SUBFOLDER="hunyuan3d-vae-v2-mini-turbo" ;;
+    *)                         VAE_REPO="";                         VAE_SUBFOLDER="" ;;
+esac
+hf_snapshot_dir() {  # <repo_id> -> the refs/main snapshot dir, or nothing
+    local repo_dir="${HF_ROOT}/hub/models--${1//\//--}" rev
+    rev="$(cat "${repo_dir}/refs/main" 2>/dev/null || true)"
+    [[ -n "${rev}" && -d "${repo_dir}/snapshots/${rev}" ]] && echo "${repo_dir}/snapshots/${rev}"
+}
+if [[ -n "${HF_HUB_OFFLINE:-}" ]]; then
+    echo "[start] HF_HUB_OFFLINE=${HF_HUB_OFFLINE} set by operator - honoring it"
+else
+    missing=""
+    snap="$(hf_snapshot_dir "${MODEL_PATH}")"
+    for f in config.yaml model.fp16.safetensors; do
+        [[ -n "${snap}" && -s "${snap}/${SUBFOLDER}/${f}" ]] || missing="${missing} ${MODEL_PATH}/${SUBFOLDER}/${f}"
+    done
+    if [[ -n "${VAE_REPO}" ]]; then
+        vsnap="$(hf_snapshot_dir "${VAE_REPO}")"
+        for f in config.yaml model.fp16.safetensors; do
+            [[ -n "${vsnap}" && -s "${vsnap}/${VAE_SUBFOLDER}/${f}" ]] || missing="${missing} ${VAE_REPO}/${VAE_SUBFOLDER}/${f}"
+        done
+    else
+        missing="${missing} (unknown VAE mapping for ${MODEL_PATH})"
+    fi
+    if [[ -z "${missing}" ]]; then
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+        echo "[start] HF cache complete under ${HF_ROOT} (${SUBFOLDER} + ${VAE_SUBFOLDER}) -> HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"
+    else
+        echo "[start] HF cache incomplete, staying ONLINE; missing:${missing}"
+    fi
+fi
+if [[ -s "${U2NET_HOME}/u2net.onnx" ]]; then
+    echo "[start] u2net.onnx present in ${U2NET_HOME} (no GitHub fetch)"
+else
+    echo "[start] u2net.onnx absent from ${U2NET_HOME} - rembg will fetch it from GitHub on first use"
+fi
+
 python /app/api_server.py --host 127.0.0.1 --port "${UPSTREAM_PORT}" \
     --model_path "${MODEL_PATH}" --subfolder "${SUBFOLDER}" --device "${DEVICE}" &
 API_PID=$!

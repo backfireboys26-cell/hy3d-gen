@@ -32,6 +32,11 @@ balancer traffic into a still-loading worker.
       "initializing", 200 = healthy; anything else would be read as UNHEALTHY and a worker that
       is unhealthy for its whole first weight download gets terminated and relaunched (billed).
       The 200 body names the served model so a client can pick its step ladder honestly.
+  (f) upstream status codes and the headers the contract depends on pass through VERBATIM and
+      are never cached: the api_server's 429 (queue full) keeps its Retry-After, its 400
+      (bad parameter) and 404 (unknown uid -> {"status":"not_found"}) reach the client as-is.
+      The only thing the gate remembers is a completed result it has already decoded for
+      ranged download - a 404 today is a 404 on the next poll too, never a stale answer.
 
 Dependency-light on purpose: stdlib only (http.server + http.client), so the gate can never
 be the thing that breaks when the ML stack's pins move.
@@ -199,6 +204,11 @@ class GateHandler(_Base):
         self.send_header("Content-Type",
                          resp.getheader("Content-Type") or "application/json")
         self.send_header("Content-Length", str(len(data)))
+        # the queue's back-off advice (429) must survive the hop - a client that only sees the
+        # status code would guess; a client that sees Retry-After waits exactly as long as asked
+        retry_after = resp.getheader("Retry-After")
+        if retry_after:
+            self.send_header("Retry-After", retry_after)
         self.end_headers()
         self.wfile.write(data)
 

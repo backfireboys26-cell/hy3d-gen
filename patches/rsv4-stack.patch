@@ -1,8 +1,19 @@
 diff --git a/api_server.py b/api_server.py
-index b64e698..d93c4c3 100644
+index b64e698..8c9b567 100644
 --- a/api_server.py
 +++ b/api_server.py
-@@ -206,7 +206,9 @@ class ModelWorker:
+@@ -20,7 +20,10 @@ import asyncio
+ import base64
+ import logging
+ import logging.handlers
++import math
+ import os
++import queue
++import re
+ import sys
+ import tempfile
+ import threading
+@@ -206,7 +209,9 @@ class ModelWorker:
              params['octree_resolution'] = params.get("octree_resolution", 128)
              params['num_inference_steps'] = params.get("num_inference_steps", 5)
              params['guidance_scale'] = params.get('guidance_scale', 5.0)
@@ -13,7 +24,7 @@ index b64e698..d93c4c3 100644
              import time
              start_time = time.time()
              mesh = self.pipeline(**params)[0]
-@@ -219,11 +221,17 @@ class ModelWorker:
+@@ -219,11 +224,17 @@ class ModelWorker:
              mesh = self.pipeline_tex(mesh, image)
  
          type = params.get('type', 'glb')
@@ -36,45 +47,230 @@ index b64e698..d93c4c3 100644
  
          torch.cuda.empty_cache()
          return save_path, uid
-@@ -274,12 +282,34 @@ async def generate(request: Request):
-         return JSONResponse(ret, status_code=404)
+@@ -243,58 +254,218 @@ app.add_middleware(
  
- 
-+# --- LOCAL PATCH (2026-08-25): honest async failure reporting ---
-+# /send ran worker.generate in a raw thread with NO exception capture, and /status inferred
-+# state solely from "does the output .glb exist yet?". A worker crash (e.g. the FlashVDM
-+# IndexError on empty occupancy) therefore left /status returning 'processing' FOREVER, so the
-+# only downstream failure detector was generate3d.py's per-candidate wall-clock timeout - a
-+# crashed seed silently burned the full --timeout-s (420s). Record terminal error state here so
-+# /status can return {status:error} the instant the worker thread dies; generate3d.poll() already
-+# handles status=='error' and fails the seed in seconds. Success is still detected by the file,
-+# so the happy path is unchanged.
-+JOB_ERRORS = {}                    # uid(str) -> {"status":"error", "error": "<Type: msg>"}
-+JOB_ERRORS_LOCK = threading.Lock()
-+
-+
-+def _run_generate(uid, params):
-+    try:
-+        worker.generate(uid, params)
-+    except Exception as e:
-+        logger.error("generate worker crashed for uid %s:\n%s", uid, traceback.format_exc())
-+        with JOB_ERRORS_LOCK:
-+            JOB_ERRORS[str(uid)] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-+
-+
- @app.post("/send")
+ @app.post("/generate")
  async def generate(request: Request):
-     logger.info("Worker send...")
-     params = await request.json()
-     uid = uuid.uuid4()
--    threading.Thread(target=worker.generate, args=(uid, params,)).start()
-+    threading.Thread(target=_run_generate, args=(uid, params,)).start()
-     ret = {"uid": str(uid)}
-     return JSONResponse(ret, status_code=200)
+-    logger.info("Worker generating...")
+-    params = await request.json()
+-    uid = uuid.uuid4()
+-    try:
+-        file_path, uid = worker.generate(uid, params)
+-        return FileResponse(file_path)
+-    except ValueError as e:
+-        traceback.print_exc()
+-        print("Caught ValueError:", e)
+-        ret = {
+-            "text": server_error_msg,
+-            "error_code": 1,
+-        }
+-        return JSONResponse(ret, status_code=404)
+-    except torch.cuda.CudaError as e:
+-        print("Caught torch.cuda.CudaError:", e)
+-        ret = {
+-            "text": server_error_msg,
+-            "error_code": 1,
+-        }
+-        return JSONResponse(ret, status_code=404)
+-    except Exception as e:
+-        print("Caught Unknown Error", e)
+-        traceback.print_exc()
+-        ret = {
+-            "text": server_error_msg,
+-            "error_code": 1,
+-        }
+-        return JSONResponse(ret, status_code=404)
++    # LOCAL PATCH (2026-09-02): the synchronous /generate ran worker.generate in the request
++    # thread, OUTSIDE the single-flight queue below - a second entrance that could double-load
++    # the card. Every generation goes through /send + /status now.
++    return JSONResponse({"error": "/generate is disabled in this build: use POST /send then "
++                                  "GET /status/{uid}"}, status_code=410)
++
++
++# --- LOCAL PATCH (2026-08-25 + 2026-09-02): honest async state, bounded single-flight queue,
++# parameter validation, honest 404 ---
++# /send used to start a raw thread per request with NO exception capture and NO limit: two
++# clients double-loaded the card (each generation holds its own activations; two at once on a
++# 24 GB card OOM or thrash), and /status inferred state solely from "does the .glb exist yet?"
++# - a crashed worker OR an unknown uid (a worker replaced by the load balancer, a typo) read
++# 'processing' forever, so the only downstream failure detector was generate3d.py's per-seed
++# wall-clock timeout (a replaced worker burned the client's full budget).
++# Now:
++#   * ONE generation thread consumes a FIFO; at most 1 generation in flight and at most
++#     HY3D_QUEUE_MAX (default 4 = the endpoint's REQUEST_COUNT scaling target) queued; beyond
++#     that /send answers 429 + Retry-After + a JSON body, instantly, so the caller can back off
++#     or fan out to another worker instead of piling onto this one.
++#   * /send validates the numeric fields BEFORE accepting the job: octree_resolution 64..512,
++#     num_inference_steps 1..100, guidance_scale 0..30, seed an integer torch can seed with;
++#     anything else is a 400 naming the field. Unknown fields are ignored (never fatal).
++#   * /status knows every uid it has accepted: 'queued' (with position), 'processing', 'error'
++#     (with the exception), 'completed' (file present, as before). An unknown uid is a 404
++#     {"status": "not_found"} - never a guess. generate3d.poll() already stops on 'error' and
++#     on a non-200, so both terminal cases fail a seed in seconds, not minutes.
++QUEUE_MAX = max(0, int(os.environ.get("HY3D_QUEUE_MAX", "4")))
++# seconds per outstanding job used for Retry-After (a 4090 does 30 steps at octree 384 in ~10 s;
++# Pascal takes ~180 s - tune per host, it is only advice to the client)
++JOB_ETA_S = max(1, int(os.environ.get("HY3D_JOB_ETA_S", "30")))
++_JOBS_KEEP = 512                       # terminal records kept for /status before pruning
++_UID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
++
++_JOBS = {}                             # uid -> {"status", "seq", "error"}
++_JOBS_LOCK = threading.Lock()
++_JOB_SEQ = 0
++_QUEUE = queue.Queue()                 # (uid, params) FIFO for the single generation thread
++
++_INT_RANGES = {
++    "octree_resolution": (64, 512),
++    "num_inference_steps": (1, 100),
++    # torch.Generator.manual_seed accepts [-2**63, 2**64-1]
++    "seed": (-(1 << 63), (1 << 64) - 1),
++}
++_FLOAT_RANGES = {"guidance_scale": (0.0, 30.0)}
++
++
++def _as_int(v):
++    if isinstance(v, bool):
++        return None
++    if isinstance(v, int):
++        return v
++    if isinstance(v, float) and math.isfinite(v) and v.is_integer():
++        return int(v)
++    if isinstance(v, str) and re.fullmatch(r"\s*[+-]?\d+\s*", v):
++        return int(v)
++    return None
++
++
++def _as_float(v):
++    if isinstance(v, bool):
++        return None
++    if isinstance(v, (int, float)):
++        return float(v) if math.isfinite(v) else None
++    if isinstance(v, str):
++        try:
++            f = float(v)
++        except ValueError:
++            return None
++        return f if math.isfinite(f) else None
++    return None
++
++
++def validate_params(params):
++    """(clean_params, None) or (None, "field: why"). Null-valued keys count as absent."""
++    if not isinstance(params, dict):
++        return None, "body: a JSON object is required"
++    clean = {k: v for k, v in params.items() if v is not None}
++    if "image" not in clean and "mesh" not in clean:
++        return None, "image: required (base64-encoded PNG/JPEG)"
++    if "image" in clean and not (isinstance(clean["image"], str) and clean["image"].strip()):
++        return None, "image: must be a non-empty base64 string"
++    for key, (lo, hi) in _INT_RANGES.items():
++        if key in clean:
++            v = _as_int(clean[key])
++            if v is None:
++                return None, f"{key}: must be an integer"
++            if not lo <= v <= hi:
++                return None, f"{key}: must be within [{lo}, {hi}] (got {v})"
++            clean[key] = v
++    for key, (lo, hi) in _FLOAT_RANGES.items():
++        if key in clean:
++            v = _as_float(clean[key])
++            if v is None:
++                return None, f"{key}: must be a number"
++            if not lo <= v <= hi:
++                return None, f"{key}: must be within [{lo}, {hi}] (got {v})"
++            clean[key] = v
++    if "mc_algo" in clean and clean["mc_algo"] not in ("mc", "dmc"):
++        return None, "mc_algo: must be 'mc' or 'dmc'"
++    if "type" in clean and clean["type"] != "glb":
++        return None, "type: only 'glb' is served by /status"
++    return clean, None
++
++
++def _backlog_locked():
++    """(in_flight, queued); caller holds _JOBS_LOCK."""
++    in_flight = sum(1 for j in _JOBS.values() if j["status"] == "processing")
++    queued = sum(1 for j in _JOBS.values() if j["status"] == "queued")
++    return in_flight, queued
++
++
++def _prune_locked():
++    terminal = sorted((j["seq"], uid) for uid, j in _JOBS.items()
++                      if j["status"] in ("completed", "error"))
++    for _, uid in terminal[:max(0, len(terminal) - _JOBS_KEEP)]:
++        _JOBS.pop(uid, None)
++
++
++def _generation_loop():
++    """The ONLY place worker.generate runs: one job at a time, FIFO, state recorded honestly."""
++    while True:
++        uid, params = _QUEUE.get()
++        try:
++            with _JOBS_LOCK:
++                job = _JOBS.get(uid)
++                if job is None:
++                    continue
++                job["status"] = "processing"
++            try:
++                worker.generate(uid, params)
++                with _JOBS_LOCK:
++                    _JOBS[uid]["status"] = "completed"
++            except Exception as e:
++                logger.error("generate worker crashed for uid %s:\n%s", uid, traceback.format_exc())
++                with _JOBS_LOCK:
++                    _JOBS[uid].update(status="error", error=f"{type(e).__name__}: {e}")
++        finally:
++            _QUEUE.task_done()
++
++
++def start_generation_loop():
++    t = threading.Thread(target=_generation_loop, name="hy3d-generate", daemon=True)
++    t.start()
++    return t
  
-@@ -287,14 +317,16 @@ async def generate(request: Request):
+ 
+ @app.post("/send")
+-async def generate(request: Request):
+-    logger.info("Worker send...")
+-    params = await request.json()
+-    uid = uuid.uuid4()
+-    threading.Thread(target=worker.generate, args=(uid, params,)).start()
+-    ret = {"uid": str(uid)}
+-    return JSONResponse(ret, status_code=200)
++async def send(request: Request):
++    global _JOB_SEQ
++    try:
++        params = await request.json()
++    except Exception:
++        return JSONResponse({"error": "body: invalid JSON", "field": "body"}, status_code=400)
++    clean, why = validate_params(params)
++    if why is not None:
++        return JSONResponse({"error": why, "field": why.split(":", 1)[0]}, status_code=400)
++    uid = str(uuid.uuid4())
++    with _JOBS_LOCK:
++        in_flight, queued = _backlog_locked()
++        if in_flight + queued >= 1 + QUEUE_MAX:
++            retry_after = max(5, (in_flight + queued) * JOB_ETA_S)
++            logger.warning("Worker send: busy (in_flight=%d queued=%d max=%d) -> 429",
++                           in_flight, queued, QUEUE_MAX)
++            return JSONResponse(
++                {"status": "busy", "error": f"busy: 1 generation in flight and {queued} queued "
++                                            f"(queue_max {QUEUE_MAX}); retry after {retry_after}s",
++                 "in_flight": in_flight, "queued": queued, "queue_max": QUEUE_MAX,
++                 "retry_after_s": retry_after},
++                status_code=429, headers={"Retry-After": str(retry_after)})
++        _JOB_SEQ += 1
++        _JOBS[uid] = {"status": "queued", "seq": _JOB_SEQ, "error": None}
++        _prune_locked()
++        position = queued + 1
++    _QUEUE.put((uid, clean))
++    logger.info("Worker send: uid %s queued (position %d, in_flight %d)", uid, position, in_flight)
++    return JSONResponse({"uid": uid, "status": "queued", "position": position}, status_code=200)
+ 
+ 
  @app.get("/status/{uid}")
  async def status(uid: str):
++    if not _UID_RE.match(uid):
++        return JSONResponse({"status": "not_found", "uid": uid}, status_code=404)
      save_file_path = os.path.join(SAVE_DIR, f'{uid}.glb')
 -    print(save_file_path, os.path.exists(save_file_path))
 -    if not os.path.exists(save_file_path):
@@ -85,16 +281,33 @@ index b64e698..d93c4c3 100644
          base64_str = base64.b64encode(open(save_file_path, 'rb').read()).decode()
          response = {'status': 'completed', 'model_base64': base64_str}
          return JSONResponse(response, status_code=200)
-+    with JOB_ERRORS_LOCK:
-+        err = JOB_ERRORS.get(str(uid))
-+    if err is not None:
-+        return JSONResponse(err, status_code=200)
-+    response = {'status': 'processing'}
-+    return JSONResponse(response, status_code=200)
++    with _JOBS_LOCK:
++        job = _JOBS.get(uid)
++        if job is None:
++            return JSONResponse({"status": "not_found", "uid": uid}, status_code=404)
++        snap = dict(job)
++        if snap["status"] == "queued":
++            snap["position"] = 1 + sum(1 for j in _JOBS.values()
++                                       if j["status"] == "queued" and j["seq"] < snap["seq"])
++    if snap["status"] == "error":
++        return JSONResponse({"status": "error", "error": snap["error"]}, status_code=200)
++    if snap["status"] == "queued":
++        return JSONResponse({"status": "queued", "position": snap["position"]}, status_code=200)
++    if snap["status"] == "completed":
++        # the record says done but the file is gone (cache wiped): terminal, not 'processing'
++        return JSONResponse({"status": "error", "error": "result file missing"}, status_code=200)
++    return JSONResponse({"status": "processing"}, status_code=200)
++
++
++@app.get("/queue")
++async def queue_state():
++    with _JOBS_LOCK:
++        in_flight, queued = _backlog_locked()
++    return JSONResponse({"in_flight": in_flight, "queued": queued, "queue_max": QUEUE_MAX})
  
  
  if __name__ == "__main__":
-@@ -306,11 +338,14 @@ if __name__ == "__main__":
+@@ -306,11 +477,16 @@ if __name__ == "__main__":
      parser.add_argument("--device", type=str, default="cuda")
      parser.add_argument("--limit-model-concurrency", type=int, default=5)
      parser.add_argument('--enable_tex', action='store_true')
@@ -110,6 +323,8 @@ index b64e698..d93c4c3 100644
 -                         tex_model_path=args.tex_model_path)
 -    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 +                         tex_model_path=args.tex_model_path, subfolder=args.subfolder)
++    start_generation_loop()
++    logger.info("single-flight generation queue up: 1 in flight, %d queued max", QUEUE_MAX)
 +    uvicorn.run(app, host=args.host, port=int(args.port), log_level="info")
 diff --git a/hy3dgen/shapegen/models/autoencoders/volume_decoders.py b/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
 index d7bfd84..0afbff1 100644
