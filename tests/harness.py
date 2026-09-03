@@ -80,6 +80,20 @@ else:
 
 import api_server as s  # noqa: E402
 
+HAS_R3 = hasattr(s, "publish_result") and hasattr(s, "result_path")
+if not HAS_R3:
+    # CONTROL MODE: a pre-round-3 api_server (e.g. the cu124-20260903-336a1a3 image) has no atomic
+    # publish helper. Mimic its inline, non-atomic export so cases O/O2 measure the OLD behaviour
+    # honestly (FAIL rows) instead of dying on a missing attribute; N and O3 guard themselves.
+    s.result_path = lambda uid, type="glb": os.path.join(s.SAVE_DIR, f"{uid}.{type}")
+
+    def _old_publish(mesh, uid, type="glb"):
+        mesh.export(s.result_path(uid, type), file_type=type)
+        return s.result_path(uid, type)
+    s.publish_result = _old_publish
+    print("[harness] CONTROL MODE: api_server has no publish_result/result_path (pre-round-3) - the round-3 cases are expected to FAIL",
+          flush=True)
+
 
 class SlowMesh:
     """Stands in for the trimesh object the pipeline returns: export() writes the result in two
@@ -491,16 +505,19 @@ check("O2 the gate's handle + ranged bytes after completion are the whole result
       c == 200 and b.get("sha256") == SLOW_SHA and b.get("size") == len(SLOW_RESULT) and raw2 == SLOW_RESULT, f"-> {c} {b}")
 
 # O3: the gate's own integrity guard, unit-tested on the module (a lying upstream is a 502, never a latch)
-spec = importlib.util.spec_from_file_location("auth_gate_mod", GATE_PY)
-gm = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(gm)
-mm = gm._integrity_mismatch
-sha_abc = hashlib.sha256(b"abc").hexdigest()
-check("O3 _integrity_mismatch: matching size+sha -> None; declared size 5 for 3 bytes -> reason; wrong sha -> reason; nothing declared -> None",
-      mm({"size": 3, "sha256": sha_abc}, b"abc", sha_abc) is None
-      and "declared size 5" in (mm({"size": 5}, b"abc", sha_abc) or "")
-      and "sha256" in (mm({"sha256": "00" * 32}, b"abc", sha_abc) or "")
-      and mm({}, b"abc", sha_abc) is None)
+try:
+    spec = importlib.util.spec_from_file_location("auth_gate_mod", GATE_PY)
+    gm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gm)
+    mm = gm._integrity_mismatch
+    sha_abc = hashlib.sha256(b"abc").hexdigest()
+    check("O3 _integrity_mismatch: matching size+sha -> None; declared size 5 for 3 bytes -> reason; wrong sha -> reason; nothing declared -> None",
+          mm({"size": 3, "sha256": sha_abc}, b"abc", sha_abc) is None
+          and "declared size 5" in (mm({"size": 5}, b"abc", sha_abc) or "")
+          and "sha256" in (mm({"sha256": "00" * 32}, b"abc", sha_abc) or "")
+          and mm({}, b"abc", sha_abc) is None)
+except Exception as e:
+    check("O3 the gate has an _integrity_mismatch guard", False, repr(e))
 wait_drain(30)
 
 # --- P. a 401 drains the request body: the keep-alive connection stays usable ---
@@ -510,14 +527,14 @@ try:
     head1, b1 = raw_http(sock, b"POST /send HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
                                b"Content-Length: %d\r\n\r\n" % len(body) + body)
     check("P 401 (no token) on a keep-alive connection, without Connection: close",
-          head1.startswith(b"HTTP/1.1 401") and b"connection: close" not in head1.lower(), head1.splitlines()[0] if head1 else "EMPTY")
+          head1.startswith(b"HTTP/1.1 401") and b"connection: close" not in head1.lower(), head1.splitlines()[0] if head1 else b"EMPTY")
     head2, b2 = raw_http(sock, b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
     check("P the NEXT request on the SAME connection is parsed cleanly: GET /ping -> 200 (not an HTML 400 from leftover JSON)",
-          head2.startswith(b"HTTP/1.1 200"), (head2.splitlines()[0] if head2 else "EMPTY") + b" " + b2[:60])
+          head2.startswith(b"HTTP/1.1 200"), (head2.splitlines()[0] if head2 else b"EMPTY") + b" " + b2[:60])
     head3, b3 = raw_http(sock, b"POST /send HTTP/1.1\r\nHost: x\r\nX-HY3D-Token: %s\r\nContent-Type: application/json\r\n"
                                b"Content-Length: %d\r\n\r\n" % (TOKEN.encode(), len(body)) + body)
     check("P then a valid tokened POST /send on the same connection is accepted (200 + uid)",
-          head3.startswith(b"HTTP/1.1 200") and b'"uid"' in b3, (head3.splitlines()[0] if head3 else "EMPTY") + b" " + b3[:80])
+          head3.startswith(b"HTTP/1.1 200") and b'"uid"' in b3, (head3.splitlines()[0] if head3 else b"EMPTY") + b" " + b3[:80])
     sock.close()
 except Exception as e:
     check("P keep-alive 401 sequence", False, repr(e))
@@ -587,19 +604,22 @@ q = req("GET", "/queue")[2]
 check("N /queue reports watchdog_alive:true, a fresh watchdog_age_s (<= 3 ticks of 1 s) and watchdog_tick_s",
       q.get("watchdog_alive") is True and isinstance(q.get("watchdog_age_s"), (int, float)) and q["watchdog_age_s"] <= 3
       and q.get("watchdog_tick_s") == 1, f"{q}")
-s._WATCHDOG_STOP.set()
-s._WATCHDOG_THREAD.join(5)
-time.sleep(3.5)
-q = req("GET", "/queue")[2]
-check("N a stopped watchdog reads watchdog_alive:false with an age past 3 ticks",
-      q.get("watchdog_alive") is False and (q.get("watchdog_age_s") or 0) > 3, f"{q}")
-c, h, b = req("GET", "/ping")
-check("N gate health -> 503 naming the watchdog while it is dead", c == 503 and "watchdog" in (b.get("reason") or ""), f"-> {c} {b}")
-s.start_watchdog()
-time.sleep(0.5)
-c, h, b = req("GET", "/ping")
-q = b.get("queue") or {}
-check("N restarting the watchdog restores 200 health with watchdog_alive:true", c == 200 and q.get("watchdog_alive") is True, f"-> {c} {q}")
+try:
+    s._WATCHDOG_STOP.set()
+    s._WATCHDOG_THREAD.join(5)
+    time.sleep(3.5)
+    q = req("GET", "/queue")[2]
+    check("N a stopped watchdog reads watchdog_alive:false with an age past 3 ticks",
+          q.get("watchdog_alive") is False and (q.get("watchdog_age_s") or 0) > 3, f"{q}")
+    c, h, b = req("GET", "/ping")
+    check("N gate health -> 503 naming the watchdog while it is dead", c == 503 and "watchdog" in (b.get("reason") or ""), f"-> {c} {b}")
+    s.start_watchdog()
+    time.sleep(0.5)
+    c, h, b = req("GET", "/ping")
+    q = b.get("queue") or {}
+    check("N restarting the watchdog restores 200 health with watchdog_alive:true", c == 200 and q.get("watchdog_alive") is True, f"-> {c} {q}")
+except Exception as e:
+    check("N the api_server exposes a stoppable/restartable watchdog (_WATCHDOG_STOP, start_watchdog)", False, repr(e))
 
 # --- L. a hung generation: watchdog -> honest errors, unhealthy /queue, 503 health, no new work ---
 s.JOB_MAX_S = 3
