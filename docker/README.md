@@ -2,7 +2,7 @@
 name: forge-generation-docker
 description: The deployable FORGE generation container (patched Hunyuan3D-2GP + stdlib auth gate) - build/run commands for WSL2 and the RunPod LOAD_BALANCER endpoint it targets.
 type: reference
-updated: 2026-09-02
+updated: 2026-09-03
 ---
 
 # FORGE generation container (pillar-3 Phase B)
@@ -18,8 +18,9 @@ RunPod endpoint) and the client is identical.
 |---|---|
 | `Dockerfile` | python:3.12-slim + torch 2.5.1 cu124 wheels + Hunyuan3D-2GP @ `f2456e0` + the vaulted container requirements under TWO constraint files + `rsv4-stack.patch` (applied after pip so a patch change rebuilds from cache). Weights NOT baked (`HF_HOME`, default `/runpod-volume/hf`). |
 | `constraints.txt` | every package of the published image, pinned (`pip freeze` of `cu124-20260902b`, torch flavor left to the index). Regenerate from a built image when a dependency is deliberately moved. |
-| `auth_gate.py` | stdlib-only front door on `$PORT`: bearer auth (only when `HY3D_TOKEN` set), honest `$HEALTH_CHECK_PATH` (200 only when the api_server socket accepts - i.e. weights loaded), reverse proxy to the loopback api_server; passes 400/404/429 (+`Retry-After`) through verbatim, caches nothing but decoded results for ranged download. |
-| `start.sh` | runs api_server on `127.0.0.1:$UPSTREAM_PORT` + auth_gate on `$PORT`; either process dying kills the container. Refuses to start without `/runpod-volume`; keeps u2net on the volume; sets `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` by itself when the cache already holds the dit + turbo-VAE snapshot (logs which path is missing otherwise). |
+| `auth_gate.py` | stdlib-only front door on `$PORT`: bearer auth (only when `HY3D_TOKEN` set), honest `$HEALTH_CHECK_PATH` (204 while the api_server socket is not yet accepting = weights loading; 200 once it serves AND its `/queue` says `healthy:true`; **503 `{"status":"unhealthy","reason"}` when `/queue` says `healthy:false`** - a job past `HY3D_JOB_MAX_S` or a dead loop - so the load balancer recycles a wedged worker), reverse proxy to the loopback api_server; passes 400/404/429 (+`Retry-After`) through verbatim, caches nothing but decoded results for ranged download. |
+| `start.sh` | runs api_server on `127.0.0.1:$UPSTREAM_PORT` + auth_gate on `$PORT`; either process dying kills the container, loudly (an ERR trap names the line; nothing exits silently). Refuses to start without `/runpod-volume`; keeps u2net on the volume; sets `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` by itself when the cache already holds the dit + turbo-VAE snapshot, and on an EMPTY or partial cache logs `HF cache incomplete, staying ONLINE; missing: <paths>` and boots online so the volume self-populates (`../tests/test-start-sh.sh` case B - the 2026-09-02 round-1 copy died here with exit 1 and no output). |
+| `../tests/` | the no-GPU contract tests (`harness.py` with a stubbed pipeline, `test-start-sh.sh` against a real image); baked into the image at `/app/tests`. See `../tests/README.md`. |
 
 ## Environment
 
@@ -27,7 +28,7 @@ RunPod endpoint) and the client is identical.
 |---|---|---|
 | `PORT` | `8080` | gate listen port (RunPod LB sets this) |
 | `PORT_HEALTH` | `= PORT` | health listener port; if different, a health-only listener is added |
-| `HEALTH_CHECK_PATH` | `/ping` | unauthenticated health path; 200 = api_server serving, 503 = still loading |
+| `HEALTH_CHECK_PATH` | `/ping` | unauthenticated health path; 204 = still loading, 200 = serving and healthy, 503 = wedged (recycle) |
 | `HY3D_TOKEN` | *(unset)* | bearer token. **Unset = OPEN** (local test mode). Set at runtime only - never baked, never in the vault (DPAPI store name on the client side: `gen3d_endpoint_token`) |
 | `HF_HOME` | `/runpod-volume/hf` | weight cache - point at the mounted volume; first warm run downloads once |
 | `MODEL_PATH` | `tencent/Hunyuan3D-2mini` | HF model repo |
@@ -36,6 +37,11 @@ RunPod endpoint) and the client is identical.
 | `UPSTREAM_PORT` | `8081` | loopback port the api_server binds inside the container |
 | `HY3D_QUEUE_MAX` | `4` | jobs the api_server queues behind the ONE in flight (matches the endpoint's REQUEST_COUNT 4); the next `/send` is a 429 |
 | `HY3D_JOB_ETA_S` | `30` | seconds per outstanding job used for the 429's `Retry-After` (advice only) |
+| `HY3D_JOB_MAX_S` | `900` | wall-clock budget for ONE generation (= the endpoint's request timeout). A job still `processing` past it means the worker is wedged: every outstanding job -> `error` naming the budget, `/queue` -> `stuck:true healthy:false`, `/ping` -> 503, `/send` -> 503. `0` disables (never on the endpoint) |
+| `HY3D_WATCHDOG_S` | `5` | watchdog tick (seconds) |
+| `HY3D_STUCK_EXIT` | `1` | once wedged, exit the api_server with 3 after the grace window so start.sh takes the container down and the platform relaunches it; `0` keeps the wedged worker up (unhealthy, refusing work) for inspection |
+| `HY3D_STUCK_EXIT_GRACE_S` | `15` | seconds the wedged worker holds the honest state (503s, `error` statuses) before exit 3, so a client mid-poll reads the terminal answer |
+| `HEALTH_QUEUE_TIMEOUT_S` / `HEALTH_UNREADABLE_MAX_S` | `5` / `120` | gate: how long one `/queue` read may take, and how long `/queue` may stay unreadable (a GIL stall during marching cubes is not a wedge) before that itself is a 503 |
 | `HF_HUB_OFFLINE` | *(auto)* | unset = start.sh decides from the cache (offline when complete); `0`/`1` set by the operator always wins |
 | `HY3D_ALLOW_EPHEMERAL_CACHE` | `0` | `1` lets a local run start without `/runpod-volume` mounted |
 
@@ -48,7 +54,10 @@ RunPod endpoint) and the client is identical.
 | `POST /send` with `octree_resolution` outside 64..512, `num_inference_steps` outside 1..100, `guidance_scale` outside 0..30, a non-integer `seed`, no `image`, `mc_algo` not mc/dmc, `type` not glb, or a non-object body | `400 {"error":"<field>: <why>", "field":"<field>"}` - unknown fields are ignored, never fatal |
 | `GET /status/{uid}` | `200 {"status":"queued","position"}` / `{"status":"processing"}` / `{"status":"error","error"}` / `{"status":"completed","model_base64"}` (or the gate's `download` handle over 16 MiB) |
 | `GET /status/{uid}` for a uid this worker never accepted | `404 {"status":"not_found"}` - a replaced worker fails the client in one poll instead of burning its timeout |
-| `GET /queue` | `{"in_flight","queued","queue_max"}` |
+| `GET /status/{uid}` for a job that extracted no surface (1-2 steps of the non-turbo dit) | `200 {"status":"error","error":"RuntimeError: no surface extracted at N steps / octree M (the pipeline returned no mesh) - raise num_inference_steps (>= 5 on the non-turbo dit) or try another seed"}` |
+| `GET /queue` | `{"in_flight","queued","queue_max","loop_alive","in_flight_age_s","job_max_s","stuck","healthy","reason"}` - `healthy:false` (+`reason`) once a job outlives `HY3D_JOB_MAX_S` or the loop thread died; the gate turns that into a 503 health |
+| any request while wedged | `/status/<every outstanding uid>` -> `error` naming the budget; `POST /send` -> `503 {"status":"unhealthy","error"}`; `/ping` -> 503; then (default) the process exits 3 after `HY3D_STUCK_EXIT_GRACE_S` and start.sh takes the container down |
+| a `SystemExit`/`BaseException` inside `generate()` | recorded as `status:error` naming it; the loop thread survives and the next job runs |
 | `POST /generate` (upstream's synchronous path) | `410` - it bypassed the queue |
 
 ## Build (WSL2 Ubuntu on rsv4)
@@ -95,6 +104,9 @@ CI (`backfireboys26-cell/hy3d-gen`, `.github/workflows/build.yml`) pushes two ta
 every push to `main`: the floating lane tag (`cu124`, `hy3d21`, `trellis2`, `pixal3d`) and an
 IMMUTABLE `<lane>-<utc date>-<short sha>` (e.g. `cu124-20260902-abc1234`). The endpoint is
 pinned to an immutable tag only; the floating tag is for the bake-off lanes and local pulls.
+The current pin is quoted in the "Round 2" section of `projects/2026-08-31-gen-hosting-proof.md`
+(read it from `get-endpoint`, never from memory). Before re-pinning, run `../tests/` against the
+new tag (`run-harness-in-image.sh`, `test-start-sh.sh`) and the real-model probe on GPU 1.
 
 ## RunPod deployment (post spend-gate; see `projects/2026-08-31-gen-hosting-proof.md`)
 

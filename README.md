@@ -7,3 +7,4 @@ mount a volume and set HF_HOME. See docker/README.md for run details.
 Published images (GHCR): floating lane tags `cu124` / `hy3d21` / `trellis2` / `pixal3d` plus an
 IMMUTABLE `<lane>-<utc date>-<short sha>` per build (CI: .github/workflows/build.yml). The RunPod
 endpoint is pinned to an immutable `cu124-*` tag only. Python deps are pinned by docker/constraints.txt.
+Contract tests (no GPU) live in tests/ and are baked into every image at /app/tests - see tests/README.md.

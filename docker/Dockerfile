@@ -70,6 +70,10 @@ RUN git -C /app apply --verbose /tmp/rsv4-stack.patch
 COPY docker/auth_gate.py /app/auth_gate.py
 COPY docker/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
+# the contract tests ride along (tiny, stdlib + the stack already here) so ANY host with the
+# image can prove the /send-/status-/queue contract with the pipeline stubbed, no GPU:
+#   docker run --rm --entrypoint python <image> /app/tests/harness.py --api-dir /app --log /tmp/h/harness.log
+COPY tests/ /app/tests/
 
 # the gate's default listen port; RunPod overrides via env PORT and maps it itself
 EXPOSE 8080

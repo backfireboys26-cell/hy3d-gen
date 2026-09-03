@@ -1,8 +1,8 @@
 diff --git a/api_server.py b/api_server.py
-index b64e698..8c9b567 100644
+index b64e698..51ca901 100644
 --- a/api_server.py
 +++ b/api_server.py
-@@ -20,7 +20,10 @@ import asyncio
+@@ -20,10 +20,14 @@ import asyncio
  import base64
  import logging
  import logging.handlers
@@ -13,18 +13,35 @@ index b64e698..8c9b567 100644
  import sys
  import tempfile
  import threading
-@@ -206,7 +209,9 @@ class ModelWorker:
++import time
+ import traceback
+ import uuid
+ from io import BytesIO
+@@ -206,11 +210,21 @@ class ModelWorker:
              params['octree_resolution'] = params.get("octree_resolution", 128)
              params['num_inference_steps'] = params.get("num_inference_steps", 5)
              params['guidance_scale'] = params.get('guidance_scale', 5.0)
 -            params['mc_algo'] = 'dmc'
+-            import time
 +            # 'mc' (skimage marching cubes) on this rig: 'dmc' needs the diso CUDA extension,
 +            # which is not installed (no nvcc; Pascal sm_61 box). Overridable per-request.
 +            params['mc_algo'] = params.get('mc_algo', 'mc')
-             import time
              start_time = time.time()
              mesh = self.pipeline(**params)[0]
-@@ -219,11 +224,17 @@ class ModelWorker:
+             logger.info("--- %s seconds ---" % (time.time() - start_time))
++            if mesh is None:
++                # export_to_trimesh hands back None when marching cubes found no surface - at
++                # 1-2 Euler steps of the non-turbo dit that is the normal outcome. Say what to
++                # change instead of the caller reading "'NoneType' object has no attribute
++                # 'export'" (verifier finding, 2026-09-02).
++                raise RuntimeError(
++                    f"no surface extracted at {params['num_inference_steps']} steps / octree "
++                    f"{params['octree_resolution']} (the pipeline returned no mesh) - raise "
++                    "num_inference_steps (>= 5 on the non-turbo dit) or try another seed")
+ 
+         if params.get('texture', False):
+             mesh = FloaterRemover()(mesh)
+@@ -219,11 +233,17 @@ class ModelWorker:
              mesh = self.pipeline_tex(mesh, image)
  
          type = params.get('type', 'glb')
@@ -47,7 +64,7 @@ index b64e698..8c9b567 100644
  
          torch.cuda.empty_cache()
          return save_path, uid
-@@ -243,58 +254,218 @@ app.add_middleware(
+@@ -243,58 +263,319 @@ app.add_middleware(
  
  @app.post("/generate")
  async def generate(request: Request):
@@ -107,17 +124,36 @@ index b64e698..8c9b567 100644
 +#     (with the exception), 'completed' (file present, as before). An unknown uid is a 404
 +#     {"status": "not_found"} - never a guess. generate3d.poll() already stops on 'error' and
 +#     on a non-200, so both terminal cases fail a seed in seconds, not minutes.
++#   * A WATCHDOG (2026-09-02 fix round) keeps health honest about the loop itself: a job that
++#     has been 'processing' longer than HY3D_JOB_MAX_S, or a generation thread that died, is
++#     a wedged worker - every outstanding job is failed with a named reason, /queue reports
++#     healthy:false (auth_gate turns that into a 503 on the health path so the load balancer
++#     recycles the worker instead of routing to it) and, unless HY3D_STUCK_EXIT=0, the process
++#     exits 3 so start.sh takes the container down loudly. Before this, a hung CUDA call meant
++#     /ping 200, 'processing' forever, then 429 forever, and nothing ever recycled the worker.
 +QUEUE_MAX = max(0, int(os.environ.get("HY3D_QUEUE_MAX", "4")))
 +# seconds per outstanding job used for Retry-After (a 4090 does 30 steps at octree 384 in ~10 s;
 +# Pascal takes ~180 s - tune per host, it is only advice to the client)
 +JOB_ETA_S = max(1, int(os.environ.get("HY3D_JOB_ETA_S", "30")))
++# wall-clock budget for ONE generation before the worker is declared wedged (0 = no budget).
++# Default 900 s = the endpoint's request timeout; the largest job the validator admits (octree
++# 512, 100 steps) is ~1.5 min on a 4090, ~6 min on Pascal-in-container, so 900 s is a hang,
++# not a slow job. Raise it for a slow local rig rather than disabling it.
++JOB_MAX_S = max(0, int(os.environ.get("HY3D_JOB_MAX_S", "900")))
++STUCK_EXIT = os.environ.get("HY3D_STUCK_EXIT", "1") != "0"   # exit 3 once wedged (default on)
++# seconds the wedged process stays up (503 health, /status 'error', /send 503) before exit 3, so
++# a client mid-poll reads the terminal answer and the load balancer sees the 503 first
++STUCK_EXIT_GRACE_S = max(0, int(os.environ.get("HY3D_STUCK_EXIT_GRACE_S", "15")))
++WATCHDOG_S = max(1, int(os.environ.get("HY3D_WATCHDOG_S", "5")))  # watchdog tick
 +_JOBS_KEEP = 512                       # terminal records kept for /status before pruning
 +_UID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 +
-+_JOBS = {}                             # uid -> {"status", "seq", "error"}
++_JOBS = {}                             # uid -> {"status", "seq", "error", "started_at"}
 +_JOBS_LOCK = threading.Lock()
 +_JOB_SEQ = 0
 +_QUEUE = queue.Queue()                 # (uid, params) FIFO for the single generation thread
++_LOOP_THREAD = None                    # the generation thread, so the watchdog can see it die
++_STUCK = None                          # {"reason", "since"} once the watchdog declared a wedge
 +
 +_INT_RANGES = {
 +    "octree_resolution": (64, 512),
@@ -207,24 +243,101 @@ index b64e698..8c9b567 100644
 +        try:
 +            with _JOBS_LOCK:
 +                job = _JOBS.get(uid)
-+                if job is None:
-+                    continue
++                if job is None or job["status"] != "queued":
++                    continue           # pruned, or failed by the watchdog while it waited
 +                job["status"] = "processing"
++                job["started_at"] = time.monotonic()
 +            try:
 +                worker.generate(uid, params)
-+                with _JOBS_LOCK:
-+                    _JOBS[uid]["status"] = "completed"
-+            except Exception as e:
++                _finish(uid, "completed", None)
++            except KeyboardInterrupt:
++                raise
++            except BaseException as e:
++                # BaseException, not Exception: a SystemExit / GeneratorExit raised inside
++                # generate() escaped the old `except Exception`, threading swallowed it, the
++                # loop thread died silently and the job read 'processing' forever behind a
++                # 200 /ping (verifier probe P7, 2026-09-02). Record it and keep serving.
 +                logger.error("generate worker crashed for uid %s:\n%s", uid, traceback.format_exc())
-+                with _JOBS_LOCK:
-+                    _JOBS[uid].update(status="error", error=f"{type(e).__name__}: {e}")
++                _finish(uid, "error", f"{type(e).__name__}: {e}")
 +        finally:
 +            _QUEUE.task_done()
 +
 +
++def _finish(uid, status, error):
++    """Record uid's terminal state - only while it is still 'processing'. A job the watchdog
++    already failed keeps that verdict (a late real completion still wins on /status because
++    the file exists), and a pruned record never KeyErrors the loop thread to death."""
++    with _JOBS_LOCK:
++        job = _JOBS.get(uid)
++        if job is not None and job["status"] == "processing":
++            job.update(status=status, error=error)
++
++
++def _health_locked(now):
++    """The worker's honest state for /queue; caller holds _JOBS_LOCK."""
++    in_flight, queued = _backlog_locked()
++    loop_alive = _LOOP_THREAD is not None and _LOOP_THREAD.is_alive()
++    age = None
++    for j in _JOBS.values():
++        if j["status"] == "processing" and j.get("started_at") is not None:
++            age = max(age or 0.0, now - j["started_at"])
++    if _STUCK is not None:
++        reason = _STUCK["reason"]
++    elif not loop_alive:
++        reason = "generation loop thread is dead"
++    else:
++        reason = None
++    return {"in_flight": in_flight, "queued": queued, "queue_max": QUEUE_MAX,
++            "loop_alive": loop_alive, "in_flight_age_s": None if age is None else round(age, 1),
++            "job_max_s": JOB_MAX_S, "stuck": _STUCK is not None,
++            "healthy": reason is None, "reason": reason}
++
++
++def _watchdog():
++    """Declares the worker wedged when the in-flight job outlives HY3D_JOB_MAX_S or the loop
++    thread is gone: fails every outstanding job with the reason (a client polling /status gets
++    a terminal answer at once), latches /queue healthy:false, and exits 3 unless told not to."""
++    global _STUCK
++    while True:
++        time.sleep(WATCHDOG_S)
++        now = time.monotonic()
++        with _JOBS_LOCK:
++            if _STUCK is not None:
++                continue               # already declared (HY3D_STUCK_EXIT=0): latched, quiet
++            dead = _LOOP_THREAD is not None and not _LOOP_THREAD.is_alive()
++            over = [(uid, now - j["started_at"]) for uid, j in _JOBS.items()
++                    if j["status"] == "processing" and j.get("started_at") is not None
++                    and JOB_MAX_S and now - j["started_at"] > JOB_MAX_S]
++            if not dead and not over:
++                continue
++            if over:
++                uid, age = over[0]
++                reason = (f"job {uid} exceeded HY3D_JOB_MAX_S={JOB_MAX_S}s (running {age:.0f}s)"
++                          " - generation wedged, worker recycling")
++            else:
++                reason = "generation loop thread died - worker cannot generate, recycling"
++            _STUCK = {"reason": reason, "since": now}
++            for j in _JOBS.values():
++                if j["status"] in ("processing", "queued"):
++                    j.update(status="error", error=reason)
++        logger.critical("WATCHDOG: %s%s", reason,
++                        f" -> exit 3 in {STUCK_EXIT_GRACE_S}s" if STUCK_EXIT
++                        else " (HY3D_STUCK_EXIT=0: staying up unhealthy)")
++        if STUCK_EXIT:
++            # hold the honest state for the grace window (health 503, /status 'error', /send
++            # 503), then take the process down - start.sh sees the exit and drops the container
++            time.sleep(STUCK_EXIT_GRACE_S)
++            logger.critical("WATCHDOG: exiting 3 (HY3D_STUCK_EXIT_GRACE_S=%d elapsed)", STUCK_EXIT_GRACE_S)
++            logging.shutdown()
++            os._exit(3)
++
++
 +def start_generation_loop():
++    global _LOOP_THREAD
 +    t = threading.Thread(target=_generation_loop, name="hy3d-generate", daemon=True)
 +    t.start()
++    _LOOP_THREAD = t
++    threading.Thread(target=_watchdog, name="hy3d-watchdog", daemon=True).start()
 +    return t
  
  
@@ -247,6 +360,10 @@ index b64e698..8c9b567 100644
 +        return JSONResponse({"error": why, "field": why.split(":", 1)[0]}, status_code=400)
 +    uid = str(uuid.uuid4())
 +    with _JOBS_LOCK:
++        if _STUCK is not None:
++            # HY3D_STUCK_EXIT=0 keeps a wedged worker up for inspection; it must not ACCEPT
++            # work it can never run (the loop thread is hung or gone)
++            return JSONResponse({"status": "unhealthy", "error": _STUCK["reason"]}, status_code=503)
 +        in_flight, queued = _backlog_locked()
 +        if in_flight + queued >= 1 + QUEUE_MAX:
 +            retry_after = max(5, (in_flight + queued) * JOB_ETA_S)
@@ -259,7 +376,7 @@ index b64e698..8c9b567 100644
 +                 "retry_after_s": retry_after},
 +                status_code=429, headers={"Retry-After": str(retry_after)})
 +        _JOB_SEQ += 1
-+        _JOBS[uid] = {"status": "queued", "seq": _JOB_SEQ, "error": None}
++        _JOBS[uid] = {"status": "queued", "seq": _JOB_SEQ, "error": None, "started_at": None}
 +        _prune_locked()
 +        position = queued + 1
 +    _QUEUE.put((uid, clean))
@@ -301,13 +418,14 @@ index b64e698..8c9b567 100644
 +
 +@app.get("/queue")
 +async def queue_state():
++    """Backlog + liveness: in_flight, queued, queue_max, loop_alive, in_flight_age_s, job_max_s,
++    stuck, healthy, reason. auth_gate's health path reads `healthy` (503 when false)."""
 +    with _JOBS_LOCK:
-+        in_flight, queued = _backlog_locked()
-+    return JSONResponse({"in_flight": in_flight, "queued": queued, "queue_max": QUEUE_MAX})
++        return JSONResponse(_health_locked(time.monotonic()))
  
  
  if __name__ == "__main__":
-@@ -306,11 +477,16 @@ if __name__ == "__main__":
+@@ -306,11 +587,18 @@ if __name__ == "__main__":
      parser.add_argument("--device", type=str, default="cuda")
      parser.add_argument("--limit-model-concurrency", type=int, default=5)
      parser.add_argument('--enable_tex', action='store_true')
@@ -324,7 +442,9 @@ index b64e698..8c9b567 100644
 -    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 +                         tex_model_path=args.tex_model_path, subfolder=args.subfolder)
 +    start_generation_loop()
-+    logger.info("single-flight generation queue up: 1 in flight, %d queued max", QUEUE_MAX)
++    logger.info("single-flight generation queue up: 1 in flight, %d queued max; watchdog: "
++                "job budget %ds, tick %ds, exit on wedge %s (grace %ds)", QUEUE_MAX, JOB_MAX_S,
++                WATCHDOG_S, STUCK_EXIT, STUCK_EXIT_GRACE_S)
 +    uvicorn.run(app, host=args.host, port=int(args.port), log_level="info")
 diff --git a/hy3dgen/shapegen/models/autoencoders/volume_decoders.py b/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
 index d7bfd84..0afbff1 100644

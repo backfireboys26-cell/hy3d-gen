@@ -29,9 +29,17 @@ balancer traffic into a still-loading worker.
       /result/{uid}?offset=&length= (chunks capped at RESULT_CHUNK_MAX). Small meshes pass
       through verbatim, so a local container keeps the byte-identical contract.
   (e) health follows RunPod's contract: 204 (empty) while the api_server is still loading =
-      "initializing", 200 = healthy; anything else would be read as UNHEALTHY and a worker that
+      "initializing", 200 = healthy; anything else is read as UNHEALTHY and a worker that
       is unhealthy for its whole first weight download gets terminated and relaunched (billed).
       The 200 body names the served model so a client can pick its step ladder honestly.
+      Health is NOT blind to the generation loop (2026-09-02 fix round): once the socket
+      accepts, the gate reads the api_server's GET /queue and answers 503 {"status":
+      "unhealthy","reason":...} when it reports healthy:false - a job past HY3D_JOB_MAX_S or a
+      dead loop thread - so the load balancer recycles a wedged worker instead of routing to
+      a 'healthy' one that never finishes anything. A /queue that cannot be read at all
+      (timeout, non-JSON) is 200 with "queue":"unreadable" - a GIL stall during marching
+      cubes is not a wedge - unless it has stayed unreadable for HEALTH_UNREADABLE_MAX_S
+      (default 120) straight, which is.
   (f) upstream status codes and the headers the contract depends on pass through VERBATIM and
       are never cached: the api_server's 429 (queue full) keeps its Retry-After, its 400
       (bad parameter) and 404 (unknown uid -> {"status":"not_found"}) reach the client as-is.
@@ -49,6 +57,7 @@ import json
 import os
 import socket
 import threading
+import time
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -81,6 +90,52 @@ def upstream_listening() -> bool:
             return True
     except OSError:
         return False
+
+
+# the api_server's /queue is read on every health probe; a slow answer is tolerated for this
+# long before "unreadable" itself counts as unhealthy (a wedged event loop, not a GIL stall)
+HEALTH_QUEUE_TIMEOUT_S = float(os.environ.get("HEALTH_QUEUE_TIMEOUT_S", "5"))
+HEALTH_UNREADABLE_MAX_S = float(os.environ.get("HEALTH_UNREADABLE_MAX_S", "120"))
+_unreadable_since = [None]   # monotonic time the queue first became unreadable, or None
+
+
+def upstream_queue_state():
+    """The api_server's /queue as a dict, or None when it cannot be read right now."""
+    try:
+        conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=HEALTH_QUEUE_TIMEOUT_S)
+        conn.request("GET", "/queue")
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        if resp.status != 200:
+            return None
+        obj = json.loads(data)
+        return obj if isinstance(obj, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def health_verdict():
+    """(http_code, body_or_None) for the health path - see docstring (e)."""
+    if not upstream_listening():
+        return 204, None
+    state = upstream_queue_state()
+    now = time.monotonic()
+    if state is None:
+        since = _unreadable_since[0]
+        if since is None:
+            _unreadable_since[0] = since = now
+        if now - since > HEALTH_UNREADABLE_MAX_S:
+            return 503, {"status": "unhealthy", "model": MODEL_PATH, "subfolder": SUBFOLDER,
+                         "reason": f"api_server /queue unreadable for {now - since:.0f}s "
+                                   f"(> HEALTH_UNREADABLE_MAX_S={HEALTH_UNREADABLE_MAX_S:.0f})"}
+        return 200, {"status": "ok", "model": MODEL_PATH, "subfolder": SUBFOLDER, "queue": "unreadable"}
+    _unreadable_since[0] = None
+    if state.get("healthy") is False:
+        return 503, {"status": "unhealthy", "model": MODEL_PATH, "subfolder": SUBFOLDER,
+                     "reason": state.get("reason") or "api_server reports healthy:false",
+                     "queue": state}
+    return 200, {"status": "ok", "model": MODEL_PATH, "subfolder": SUBFOLDER, "queue": state}
 
 
 APP_TOKEN_HEADER = "X-HY3D-Token"
@@ -132,13 +187,16 @@ class _Base(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _health(self) -> None:
-        if upstream_listening():
-            self._json(200, {"status": "ok", "model": MODEL_PATH, "subfolder": SUBFOLDER})
-        else:
+        code, body = health_verdict()
+        if body is None:
             # 204 = "initializing" in RunPod's health contract (200 healthy, other = unhealthy)
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if code != 200:
+            print(f"[auth_gate] health -> {code}: {body.get('reason')}", flush=True)
+        self._json(code, body)
 
 
 class GateHandler(_Base):
