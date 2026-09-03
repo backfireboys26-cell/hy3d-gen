@@ -1,9 +1,12 @@
 diff --git a/api_server.py b/api_server.py
-index b64e698..51ca901 100644
+index b64e698..396825f 100644
 --- a/api_server.py
 +++ b/api_server.py
-@@ -20,10 +20,14 @@ import asyncio
+@@ -18,12 +18,17 @@ A model worker executes the model.
+ import argparse
+ import asyncio
  import base64
++import hashlib
  import logging
  import logging.handlers
 +import math
@@ -17,7 +20,36 @@ index b64e698..51ca901 100644
  import traceback
  import uuid
  from io import BytesIO
-@@ -206,11 +210,21 @@ class ModelWorker:
+@@ -135,6 +140,28 @@ def pretty_print_semaphore(semaphore):
+ SAVE_DIR = 'gradio_cache'
+ os.makedirs(SAVE_DIR, exist_ok=True)
+ 
++
++def result_path(uid, type='glb'):
++    return os.path.join(SAVE_DIR, f'{uid}.{type}')
++
++
++def publish_result(mesh, uid, type='glb'):
++    """LOCAL PATCH (2026-09-03): the result appears at result_path(uid) ATOMICALLY - export to a
++    sibling '<uid>.<type>.partial' on the SAME filesystem, then os.replace() it into place. A
++    reader (/status, the gate's ranged /result) can never see a half-written result: before the
++    rename there is no file at the final path, after it there is the whole file. Verifier P2
++    (round 2): a big export takes seconds, and /status latched the truncated bytes as
++    'completed' with a matching sha - a truncated mesh looked like success to the client."""
++    final = result_path(uid, type)
++    partial = final + '.partial'
++    try:
++        mesh.export(partial, file_type=type)
++        os.replace(partial, final)
++    finally:
++        if os.path.exists(partial):
++            os.remove(partial)
++    return final
++
+ worker_id = str(uuid.uuid4())[:6]
+ logger = build_logger("controller", f"{SAVE_DIR}/controller.log")
+ 
+@@ -206,11 +233,21 @@ class ModelWorker:
              params['octree_resolution'] = params.get("octree_resolution", 128)
              params['num_inference_steps'] = params.get("num_inference_steps", 5)
              params['guidance_scale'] = params.get('guidance_scale', 5.0)
@@ -41,7 +73,7 @@ index b64e698..51ca901 100644
  
          if params.get('texture', False):
              mesh = FloaterRemover()(mesh)
-@@ -219,11 +233,17 @@ class ModelWorker:
+@@ -219,11 +256,16 @@ class ModelWorker:
              mesh = self.pipeline_tex(mesh, image)
  
          type = params.get('type', 'glb')
@@ -59,12 +91,11 @@ index b64e698..51ca901 100644
 +            mesh = trimesh.load(tmp_path)
 +        finally:
 +            os.remove(tmp_path)
-+        save_path = os.path.join(SAVE_DIR, f'{str(uid)}.{type}')
-+        mesh.export(save_path)
++        save_path = publish_result(mesh, uid, type)
  
          torch.cuda.empty_cache()
          return save_path, uid
-@@ -243,58 +263,319 @@ app.add_middleware(
+@@ -243,58 +285,356 @@ app.add_middleware(
  
  @app.post("/generate")
  async def generate(request: Request):
@@ -154,6 +185,9 @@ index b64e698..51ca901 100644
 +_QUEUE = queue.Queue()                 # (uid, params) FIFO for the single generation thread
 +_LOOP_THREAD = None                    # the generation thread, so the watchdog can see it die
 +_STUCK = None                          # {"reason", "since"} once the watchdog declared a wedge
++_WATCHDOG_THREAD = None                # the watchdog thread itself, so /queue can see IT die
++_WATCHDOG_LAST = [None]                # monotonic time of the watchdog's last tick
++_WATCHDOG_STOP = threading.Event()     # set -> the watchdog thread returns (tests; never on the endpoint)
 +
 +_INT_RANGES = {
 +    "octree_resolution": (64, 512),
@@ -265,8 +299,9 @@ index b64e698..51ca901 100644
 +
 +def _finish(uid, status, error):
 +    """Record uid's terminal state - only while it is still 'processing'. A job the watchdog
-+    already failed keeps that verdict (a late real completion still wins on /status because
-+    the file exists), and a pruned record never KeyErrors the loop thread to death."""
++    already failed keeps that verdict (a late real completion still wins on /status because the
++    atomically published file exists and the record is no longer processing/queued), and a
++    pruned record never KeyErrors the loop thread to death."""
 +    with _JOBS_LOCK:
 +        job = _JOBS.get(uid)
 +        if job is not None and job["status"] == "processing":
@@ -287,9 +322,18 @@ index b64e698..51ca901 100644
 +        reason = "generation loop thread is dead"
 +    else:
 +        reason = None
++    # the watchdog's own liveness (2026-09-03): a dead or stalled watchdog means a wedge would go
++    # undetected behind a 200 health - auth_gate treats watchdog_alive:false, or an age over
++    # 3 ticks, as unhealthy (503) so the platform recycles the worker
++    last = _WATCHDOG_LAST[0]
++    wd_age = None if last is None else max(0.0, now - last)
++    wd_alive = (_WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive()
++                and wd_age is not None and wd_age <= 3 * WATCHDOG_S)
 +    return {"in_flight": in_flight, "queued": queued, "queue_max": QUEUE_MAX,
 +            "loop_alive": loop_alive, "in_flight_age_s": None if age is None else round(age, 1),
 +            "job_max_s": JOB_MAX_S, "stuck": _STUCK is not None,
++            "watchdog_alive": wd_alive, "watchdog_age_s": None if wd_age is None else round(wd_age, 1),
++            "watchdog_tick_s": WATCHDOG_S,
 +            "healthy": reason is None, "reason": reason}
 +
 +
@@ -298,9 +342,9 @@ index b64e698..51ca901 100644
 +    thread is gone: fails every outstanding job with the reason (a client polling /status gets
 +    a terminal answer at once), latches /queue healthy:false, and exits 3 unless told not to."""
 +    global _STUCK
-+    while True:
-+        time.sleep(WATCHDOG_S)
++    while not _WATCHDOG_STOP.wait(WATCHDOG_S):
 +        now = time.monotonic()
++        _WATCHDOG_LAST[0] = now        # the tick /queue reports as watchdog_age_s
 +        with _JOBS_LOCK:
 +            if _STUCK is not None:
 +                continue               # already declared (HY3D_STUCK_EXIT=0): latched, quiet
@@ -332,12 +376,22 @@ index b64e698..51ca901 100644
 +            os._exit(3)
 +
 +
++def start_watchdog():
++    global _WATCHDOG_THREAD
++    _WATCHDOG_STOP.clear()
++    _WATCHDOG_LAST[0] = time.monotonic()   # counts as a tick: no false 'stalled' before the first one
++    t = threading.Thread(target=_watchdog, name="hy3d-watchdog", daemon=True)
++    t.start()
++    _WATCHDOG_THREAD = t
++    return t
++
++
 +def start_generation_loop():
 +    global _LOOP_THREAD
 +    t = threading.Thread(target=_generation_loop, name="hy3d-generate", daemon=True)
 +    t.start()
 +    _LOOP_THREAD = t
-+    threading.Thread(target=_watchdog, name="hy3d-watchdog", daemon=True).start()
++    start_watchdog()
 +    return t
  
  
@@ -382,50 +436,68 @@ index b64e698..51ca901 100644
 +    _QUEUE.put((uid, clean))
 +    logger.info("Worker send: uid %s queued (position %d, in_flight %d)", uid, position, in_flight)
 +    return JSONResponse({"uid": uid, "status": "queued", "position": position}, status_code=200)
++
++
++def _completed_response(save_file_path):
++    raw = open(save_file_path, 'rb').read()
++    # size + sha256 beside the bytes: the gate cross-checks them before it latches a result for
++    # ranged download (a mismatch is a 502, never a 'completed' with the wrong bytes)
++    return JSONResponse({'status': 'completed', 'model_base64': base64.b64encode(raw).decode(),
++                         'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}, status_code=200)
  
  
  @app.get("/status/{uid}")
  async def status(uid: str):
-+    if not _UID_RE.match(uid):
-+        return JSONResponse({"status": "not_found", "uid": uid}, status_code=404)
-     save_file_path = os.path.join(SAVE_DIR, f'{uid}.glb')
+-    save_file_path = os.path.join(SAVE_DIR, f'{uid}.glb')
 -    print(save_file_path, os.path.exists(save_file_path))
 -    if not os.path.exists(save_file_path):
 -        response = {'status': 'processing'}
 -        return JSONResponse(response, status_code=200)
 -    else:
-+    if os.path.exists(save_file_path):
-         base64_str = base64.b64encode(open(save_file_path, 'rb').read()).decode()
-         response = {'status': 'completed', 'model_base64': base64_str}
-         return JSONResponse(response, status_code=200)
+-        base64_str = base64.b64encode(open(save_file_path, 'rb').read()).decode()
+-        response = {'status': 'completed', 'model_base64': base64_str}
+-        return JSONResponse(response, status_code=200)
++    if not _UID_RE.match(uid):
++        return JSONResponse({"status": "not_found", "uid": uid}, status_code=404)
 +    with _JOBS_LOCK:
 +        job = _JOBS.get(uid)
-+        if job is None:
-+            return JSONResponse({"status": "not_found", "uid": uid}, status_code=404)
-+        snap = dict(job)
-+        if snap["status"] == "queued":
++        snap = dict(job) if job is not None else None
++        if snap is not None and snap["status"] == "queued":
 +            snap["position"] = 1 + sum(1 for j in _JOBS.values()
 +                                       if j["status"] == "queued" and j["seq"] < snap["seq"])
++    # The RECORD decides while the job is alive (2026-09-03, verifier P2): 'completed' is what
++    # the loop wrote AFTER generate() returned, never "a file exists at the path". The file is
++    # published atomically (publish_result), so it cannot be half-written - but between the
++    # rename and the record flip the honest answer is still 'processing' (one more poll).
++    if snap is not None and snap["status"] == "queued":
++        return JSONResponse({"status": "queued", "position": snap["position"]}, status_code=200)
++    if snap is not None and snap["status"] == "processing":
++        return JSONResponse({"status": "processing"}, status_code=200)
++    save_file_path = result_path(uid)
++    if os.path.exists(save_file_path):
++        # record 'completed' (file present, as before), 'error' (a late real completion of a job
++        # the watchdog had failed - the bytes are whole, serve them), or pruned (the file is the
++        # only witness left, and an atomically published file is a whole one)
++        return _completed_response(save_file_path)
++    if snap is None:
++        return JSONResponse({"status": "not_found", "uid": uid}, status_code=404)
 +    if snap["status"] == "error":
 +        return JSONResponse({"status": "error", "error": snap["error"]}, status_code=200)
-+    if snap["status"] == "queued":
-+        return JSONResponse({"status": "queued", "position": snap["position"]}, status_code=200)
-+    if snap["status"] == "completed":
-+        # the record says done but the file is gone (cache wiped): terminal, not 'processing'
-+        return JSONResponse({"status": "error", "error": "result file missing"}, status_code=200)
-+    return JSONResponse({"status": "processing"}, status_code=200)
++    # the record says done but the file is gone (cache wiped): terminal, not 'processing'
++    return JSONResponse({"status": "error", "error": "result file missing"}, status_code=200)
 +
 +
 +@app.get("/queue")
 +async def queue_state():
 +    """Backlog + liveness: in_flight, queued, queue_max, loop_alive, in_flight_age_s, job_max_s,
-+    stuck, healthy, reason. auth_gate's health path reads `healthy` (503 when false)."""
++    stuck, watchdog_alive, watchdog_age_s, watchdog_tick_s, healthy, reason. auth_gate's health
++    path reads `healthy` (503 when false) and the watchdog fields (503 when dead/stalled)."""
 +    with _JOBS_LOCK:
 +        return JSONResponse(_health_locked(time.monotonic()))
  
  
  if __name__ == "__main__":
-@@ -306,11 +587,18 @@ if __name__ == "__main__":
+@@ -306,11 +646,18 @@ if __name__ == "__main__":
      parser.add_argument("--device", type=str, default="cuda")
      parser.add_argument("--limit-model-concurrency", type=int, default=5)
      parser.add_argument('--enable_tex', action='store_true')

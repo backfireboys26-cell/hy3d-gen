@@ -45,6 +45,15 @@ balancer traffic into a still-loading worker.
       (bad parameter) and 404 (unknown uid -> {"status":"not_found"}) reach the client as-is.
       The only thing the gate remembers is a completed result it has already decoded for
       ranged download - a 404 today is a 404 on the next poll too, never a stale answer.
+  (g) 2026-09-03 round 3: an early answer (401, health, a bad Content-Length) first DRAINS the
+      request body - on a keep-alive connection an unread body was parsed as the next
+      request's start line and the client's next call got an HTML 400; a body over
+      GATE_DRAIN_MAX (64 MiB) or unparseable is answered with Connection: close instead. A
+      result is latched for ranged download only when the api_server's own declared size +
+      sha256 match the bytes it served (a mismatch is a 502, never a wrong 'completed'), and the
+      api_server only says 'completed' once its job record does (its export is atomic). Health
+      also reads the api_server's watchdog liveness: watchdog_alive:false, or a last tick older
+      than 3 ticks, is a 503 - a worker whose watchdog is dead could wedge unnoticed.
 
 Dependency-light on purpose: stdlib only (http.server + http.client), so the gate can never
 be the thing that breaks when the ML stack's pins move.
@@ -78,6 +87,9 @@ SUBFOLDER = os.environ.get("HY3D_SUBFOLDER", "")
 # a /status body above this many bytes is rewritten into a download handle (RunPod LB cap: 30 MB)
 STATUS_INLINE_MAX = int(os.environ.get("STATUS_INLINE_MAX", str(16 * 1024 * 1024)))
 RESULT_CHUNK_MAX = int(os.environ.get("RESULT_CHUNK_MAX", str(16 * 1024 * 1024)))
+# a request body up to this size is read and discarded before an early answer (401 etc.) so the
+# keep-alive connection stays in sync; anything larger is answered with Connection: close
+GATE_DRAIN_MAX = int(os.environ.get("GATE_DRAIN_MAX", str(64 * 1024 * 1024)))
 # decoded results kept for ranged download, newest last; a worker serves one client at a time
 _RESULTS = OrderedDict()
 _RESULTS_LOCK = threading.Lock()
@@ -135,7 +147,25 @@ def health_verdict():
         return 503, {"status": "unhealthy", "model": MODEL_PATH, "subfolder": SUBFOLDER,
                      "reason": state.get("reason") or "api_server reports healthy:false",
                      "queue": state}
+    stalled = watchdog_stalled(state)
+    if stalled:
+        return 503, {"status": "unhealthy", "model": MODEL_PATH, "subfolder": SUBFOLDER,
+                     "reason": stalled, "queue": state}
     return 200, {"status": "ok", "model": MODEL_PATH, "subfolder": SUBFOLDER, "queue": state}
+
+
+def watchdog_stalled(state: dict):
+    """A reason string when the api_server's watchdog is dead or has not ticked for more than
+    3 ticks (its own arithmetic, so a stale age is caught even if watchdog_alive lied), else
+    None. An api_server that does not report the fields at all (older build) is not judged."""
+    age, tick = state.get("watchdog_age_s"), state.get("watchdog_tick_s")
+    if state.get("watchdog_alive") is False:
+        return (f"api_server watchdog is not alive (last tick {age}s ago, tick {tick}s) - a wedged "
+                "generation would go undetected, recycling")
+    if isinstance(age, (int, float)) and isinstance(tick, (int, float)) and tick > 0 and age > 3 * tick:
+        return (f"api_server watchdog stalled: last tick {age:.0f}s ago (> 3 x {tick:.0f}s tick) - a "
+                "wedged generation would go undetected, recycling")
+    return None
 
 
 APP_TOKEN_HEADER = "X-HY3D-Token"
@@ -172,6 +202,20 @@ def _recall(uid: str):
         return _RESULTS.get(uid)
 
 
+def _integrity_mismatch(obj: dict, raw: bytes, sha: str):
+    """A reason when the api_server's declared size/sha256 (2026-09-03 /status fields) do not
+    match the bytes it served - such a result is never latched; None when they match or the
+    api_server (an older build) declared nothing."""
+    want_size, want_sha = obj.get("size"), (obj.get("sha256") or "")
+    if isinstance(want_size, int) and not isinstance(want_size, bool) and want_size != len(raw):
+        return (f"result integrity mismatch: api_server declared size {want_size} but served "
+                f"{len(raw)} bytes - not latched, poll /status again")
+    if isinstance(want_sha, str) and want_sha and want_sha.lower() != sha:
+        return ("result integrity mismatch: api_server declared sha256 "
+                f"{want_sha[:12]}... but the served bytes hash to {sha[:12]}... - not latched, poll /status again")
+    return None
+
+
 class _Base(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -183,8 +227,32 @@ class _Base(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            # http.server closes after this response; tell the client so it does not reuse
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def _discard_body(self) -> None:
+        """Consume the request body before an early (non-proxied) answer - docstring (g).
+        HTTP/1.1 keep-alive: an unread body stays in the socket and becomes the NEXT request's
+        start line. A body over GATE_DRAIN_MAX, a chunked body, or an unparseable
+        Content-Length is not read; the connection is closed after the answer instead."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
+        if length < 0 or length > GATE_DRAIN_MAX or chunked:
+            self.close_connection = True
+            return
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 1 << 20))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
 
     def _health(self) -> None:
         code, body = health_verdict()
@@ -204,9 +272,11 @@ class GateHandler(_Base):
 
     def _handle(self) -> None:
         if self.path.split("?", 1)[0] == HEALTH_PATH:
+            self._discard_body()
             self._health()
             return
         if not _authorized(self.headers.get(APP_TOKEN_HEADER), self.headers.get("Authorization")):
+            self._discard_body()
             self._json(401, {"error": f"unauthorized: this endpoint requires {APP_TOKEN_HEADER}: <token> "
                                       "(or Authorization: Bearer <token>)"})
             return
@@ -230,6 +300,7 @@ class GateHandler(_Base):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            self.close_connection = True       # an unsized body cannot be drained: close
             self._json(400, {"error": "bad Content-Length"})
             return
         body = self.rfile.read(length) if length else None
@@ -254,6 +325,10 @@ class GateHandler(_Base):
             if isinstance(obj, dict) and obj.get("status") == "completed" and obj.get("model_base64"):
                 raw = base64.b64decode(obj["model_base64"])
                 sha = hashlib.sha256(raw).hexdigest()
+                why = _integrity_mismatch(obj, raw, sha)
+                if why:
+                    self._json(502, {"error": why, "uid": status_uid})
+                    return
                 _remember(status_uid, raw, sha)
                 self._json(200, {"status": "completed", "download": f"/result/{status_uid}",
                                  "size": len(raw), "sha256": sha})
@@ -288,6 +363,10 @@ class GateHandler(_Base):
                 return
             raw = base64.b64decode(obj["model_base64"])
             hit = (raw, hashlib.sha256(raw).hexdigest())
+            why = _integrity_mismatch(obj, raw, hit[1])
+            if why:
+                self._json(502, {"error": why, "uid": uid})
+                return
             _remember(uid, *hit)
         raw, sha = hit
         q = parse_qs(urlsplit(self.path).query)
@@ -318,6 +397,7 @@ class HealthOnlyHandler(_Base):
     """Extra listener when PORT_HEALTH != PORT: health path only, never proxies, no auth."""
 
     def _handle(self) -> None:
+        self._discard_body()
         if self.path.split("?", 1)[0] == HEALTH_PATH:
             self._health()
         else:
