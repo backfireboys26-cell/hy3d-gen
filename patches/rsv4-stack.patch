@@ -1,12 +1,15 @@
 diff --git a/api_server.py b/api_server.py
-index b64e698..396825f 100644
+index b64e698..a5d3401 100644
 --- a/api_server.py
 +++ b/api_server.py
-@@ -18,12 +18,17 @@ A model worker executes the model.
+@@ -18,14 +18,23 @@ A model worker executes the model.
  import argparse
  import asyncio
  import base64
++import gc
 +import hashlib
++import importlib.util
++import json
  import logging
  import logging.handlers
 +import math
@@ -19,8 +22,27 @@ index b64e698..396825f 100644
 +import time
  import traceback
  import uuid
++from collections import OrderedDict
  from io import BytesIO
-@@ -135,6 +140,28 @@ def pretty_print_semaphore(semaphore):
+ 
+ import torch
+@@ -41,6 +50,15 @@ from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline, FloaterRemover, D
+ from hy3dgen.texgen import Hunyuan3DPaintPipeline
+ from hy3dgen.text2image import HunyuanDiTPipeline
+ 
++# LOCAL PATCH (2026-09-04): the model catalog (which repo/subfolder/kind/VRAM is model X) is ONE
++# module shared with start.sh's cache check and prefetch - /app/hy3d_models.py in the image;
++# beside auth_gate.py in the vault tree (the test harness puts that dir on sys.path).
++try:
++    import hy3d_models as catalog
++except ImportError as _e:   # pragma: no cover - a build without the catalog cannot serve anything
++    raise ImportError("hy3d_models.py must sit beside api_server.py (docker/hy3d_models.py in the "
++                      "build context; the harness adds the gate's directory to sys.path)") from _e
++
+ LOGDIR = '.'
+ 
+ server_error_msg = "**NETWORK ERROR DUE TO HIGH TRAFFIC. PLEASE REGENERATE OR REFRESH THIS PAGE.**"
+@@ -135,6 +153,43 @@ def pretty_print_semaphore(semaphore):
  SAVE_DIR = 'gradio_cache'
  os.makedirs(SAVE_DIR, exist_ok=True)
  
@@ -46,10 +68,267 @@ index b64e698..396825f 100644
 +            os.remove(partial)
 +    return final
 +
++
++def publish_bytes(data, uid, type):
++    """The same atomic publish for a result that is already bytes (an /imagine view set as JSON)."""
++    final = result_path(uid, type)
++    partial = final + '.partial'
++    try:
++        with open(partial, 'wb') as f:
++            f.write(data)
++        os.replace(partial, final)
++    finally:
++        if os.path.exists(partial):
++            os.remove(partial)
++    return final
++
++
  worker_id = str(uuid.uuid4())[:6]
  logger = build_logger("controller", f"{SAVE_DIR}/controller.log")
  
-@@ -206,11 +233,21 @@ class ModelWorker:
+@@ -143,7 +198,53 @@ def load_image_from_base64(image):
+     return Image.open(BytesIO(base64.b64decode(image)))
+ 
+ 
++# --- LOCAL PATCH (2026-09-04): one worker, several models, chosen per request ---------------
++# SERVED: name -> {repo, subfolder, kind: single|mv|nvs, vram_mb}; the single-image model named
++# by --model_path/--subfolder (env MODEL_PATH/HY3D_SUBFOLDER) is always in it and is the default
++# for an {"image"} body; HY3D_MODELS adds the rest (default: dit-v2-0, dit-v2-mv, dit-v2-mv-turbo,
++# zero123-xl). DEFAULTS: the model a body without 'model' gets ('image' -> the single, 'views' ->
++# the first non-turbo mv, /imagine -> the nvs). LABELS: the comma-joined 'model'/'subfolder'
++# strings /ping keeps for the 2026-09-03 client (see hy3d_models.labels for the ordering rule).
++SERVED, DEFAULTS, LABELS = OrderedDict(), {}, {}
++
++
++def configure_models(model_path=None, subfolder=None, models=None):
++    global SERVED, DEFAULTS, LABELS
++    SERVED = catalog.served(model_path, subfolder, models)
++    DEFAULTS = catalog.defaults(SERVED)
++    LABELS = catalog.labels(SERVED)
++    return SERVED
++
++
++configure_models()          # from the environment; __main__ re-applies the argparse values
++
++MAX_LOADED = max(1, int(os.environ.get("HY3D_MAX_LOADED", "4")))       # pipelines resident at once
++VRAM_MARGIN_MB = max(0, int(os.environ.get("HY3D_VRAM_MARGIN_MB", "2048")))  # activations headroom
++ZERO123_DIR = os.environ.get("HY3D_ZERO123_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "zero123"))
++
++
++def _import_nvs():
++    """The Zero123 loader module (zero123/nvs.py beside this file, or HY3D_ZERO123_DIR)."""
++    if "hy3d_nvs" in sys.modules:
++        return sys.modules["hy3d_nvs"]
++    path = os.path.join(ZERO123_DIR, "nvs.py")
++    spec = importlib.util.spec_from_file_location("hy3d_nvs", path)
++    if spec is None:
++        raise FileNotFoundError(f"zero123 loader not found at {path} (HY3D_ZERO123_DIR)")
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["hy3d_nvs"] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
+ class ModelWorker:
++    """Every served model behind ONE generation thread. Pipelines load lazily on first use and
++    stay resident (LRU, most recent last); before a load, the least-recently-used ones are
++    evicted while the card lacks `vram_mb + HY3D_VRAM_MARGIN_MB` free or more than
++    HY3D_MAX_LOADED would be resident - and each eviction is logged with the numbers. A 24 GB
++    card holds the three dits and zero123 (~19 GB); an 8 GB Pascal holds one at a time. An
++    OOM inside a generation evicts everything else and retries that generation ONCE."""
++
+     def __init__(self,
+                  model_path='tencent/Hunyuan3D-2mini',
+                  tex_model_path='tencent/Hunyuan3D-2',
+@@ -153,16 +254,24 @@ class ModelWorker:
+         self.model_path = model_path
+         self.worker_id = worker_id
+         self.device = device
+-        logger.info(f"Loading the model {model_path} on worker {worker_id} ...")
++        self.pipelines = OrderedDict()
++        self.lock = threading.RLock()
++        logger.info(f"Serving {list(SERVED)} on worker {worker_id} (defaults {DEFAULTS}; "
++                    f"max {MAX_LOADED} resident, {VRAM_MARGIN_MB} MB margin) ...")
+ 
+         self.rembg = BackgroundRemover()
+-        self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+-            model_path,
+-            subfolder=subfolder,
+-            use_safetensors=True,
+-            device=device,
+-        )
+-        self.pipeline.enable_flashvdm()
++        # HY3D_PRELOAD: comma list of models to load BEFORE the server listens (health stays 204
++        # meanwhile - "weights loaded" keeps meaning what it meant); default = the single-image
++        # default; 'none' = everything lazy
++        preload = os.environ.get("HY3D_PRELOAD")
++        names = [DEFAULTS["image"]] if preload is None else [n.strip() for n in preload.split(",") if n.strip()]
++        for raw in names:
++            if raw.lower() == "none":
++                continue
++            name = catalog.canonical(raw) or raw
++            if name not in SERVED:
++                raise ValueError(f"HY3D_PRELOAD names '{raw}', not a served model {list(SERVED)}")
++            self.ensure(name)
+         # self.pipeline_t2i = HunyuanDiTPipeline(
+         #     'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
+         #     device=device
+@@ -170,47 +279,155 @@ class ModelWorker:
+         if enable_tex:
+             self.pipeline_tex = Hunyuan3DPaintPipeline.from_pretrained(tex_model_path)
+ 
+-    def get_queue_length(self):
+-        if model_semaphore is None:
+-            return 0
+-        else:
+-            return args.limit_model_concurrency - model_semaphore._value + (len(
+-                model_semaphore._waiters) if model_semaphore._waiters is not None else 0)
+-
+-    def get_status(self):
+-        return {
+-            "speed": 1,
+-            "queue_length": self.get_queue_length(),
+-        }
++    # -- residency --------------------------------------------------------------------------
++    def loaded(self):
++        with self.lock:
++            return list(self.pipelines)
++
++    def _free_mb(self):
++        if str(self.device).startswith("cuda") and torch.cuda.is_available():
++            try:
++                free, total = torch.cuda.mem_get_info()
++                return free / 2 ** 20, total / 2 ** 20
++            except Exception:       # noqa: BLE001 - a driver hiccup must not block a load
++                return None, None
++        return None, None
++
++    def ensure(self, name):
++        """The pipeline for `name`, loading it (and evicting LRU residents first) if needed."""
++        with self.lock:
++            if name in self.pipelines:
++                self.pipelines.move_to_end(name)
++                return self.pipelines[name]
++            spec = SERVED[name]
++            need = spec["vram_mb"] + VRAM_MARGIN_MB
++            while self.pipelines:
++                free, total = self._free_mb()
++                too_many = len(self.pipelines) >= MAX_LOADED
++                too_full = free is not None and free < need
++                if not too_many and not too_full:
++                    break
++                victim = next(iter(self.pipelines))
++                logger.warning("evicting %s (least recently used): %s; loading %s needs %d MB (%d + %d margin), "
++                               "free %s MB of %s; resident %s", victim,
++                               "resident cap %d reached" % MAX_LOADED if too_many else "VRAM short",
++                               name, need, spec["vram_mb"], VRAM_MARGIN_MB,
++                               None if free is None else int(free), None if total is None else int(total),
++                               list(self.pipelines))
++                self._evict(victim)
++            free, total = self._free_mb()
++            logger.info("loading %s (%s%s) - free %s MB of %s ...", name, spec["repo"],
++                        f"/{spec['subfolder']}" if spec.get("subfolder") else "",
++                        None if free is None else int(free), None if total is None else int(total))
++            t0 = time.time()
++            pipe = self._load(name)
++            self.pipelines[name] = pipe
++            free, total = self._free_mb()
++            logger.info("loaded %s in %.0fs; resident %s; free %s MB", name, time.time() - t0,
++                        list(self.pipelines), None if free is None else int(free))
++            return pipe
++
++    def _load(self, name):
++        spec = SERVED[name]
++        if spec["kind"] == "nvs":
++            nvs = _import_nvs()
++            z = nvs.Zero123Views(spec["repo"], catalog.ZERO123_FILES, device=self.device)
++            z.load()
++            return z
++        pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
++            spec["repo"],
++            subfolder=spec["subfolder"],
++            use_safetensors=True,
++            device=self.device,
++        )
++        pipe.enable_flashvdm()
++        return pipe
++
++    def _evict(self, name):
++        pipe = self.pipelines.pop(name, None)
++        if pipe is not None and hasattr(pipe, "unload"):
++            try:
++                pipe.unload()
++            except Exception:       # noqa: BLE001
++                pass
++        del pipe
++        gc.collect()
++        if str(self.device).startswith("cuda") and torch.cuda.is_available():
++            torch.cuda.empty_cache()
++
++    def evict_all_but(self, keep):
++        with self.lock:
++            for victim in [n for n in self.pipelines if n != keep]:
++                logger.warning("evicting %s after an out-of-memory in a %s job (retrying once)", victim, keep)
++                self._evict(victim)
++
++    def _run(self, name, fn):
++        """fn() under inference_mode; on CUDA OOM with other residents, evict them and retry once."""
++        try:
++            with torch.inference_mode():
++                return fn()
++        except torch.cuda.OutOfMemoryError:
++            if len(self.loaded()) <= 1:
++                raise
++            logger.error("out of memory in a %s job with %s resident - evicting the others and retrying",
++                         name, self.loaded())
++            self.evict_all_but(name)
++            with torch.inference_mode():
++                return fn()
++
++    # -- jobs -------------------------------------------------------------------------------
++    def _prepare_images(self, params):
++        """PIL image (single) or {view: PIL} (multiview) with the background removed unless the
++        caller says it already is (background_removed: true)."""
++        removed = bool(params.get("background_removed", False))
++        # isinstance, not `in`: /imagine's body ALSO carries 'views' - a LIST of view names to
++        # synthesize, not a dict of images - and its input is the single 'image'
++        if isinstance(params.get('views'), dict):
++            views = {k: load_image_from_base64(v) for k, v in params['views'].items()}
++            if not removed:
++                views = {k: self.rembg(img) for k, img in views.items()}
++            return views
++        image = load_image_from_base64(params["image"])
++        return image if removed else self.rembg(image)
+ 
+-    @torch.inference_mode()
+     def generate(self, uid, params):
+-        if 'image' in params:
+-            image = params["image"]
+-            image = load_image_from_base64(image)
+-        else:
++        name = params.get("model") or DEFAULTS["image"]
++        if 'image' not in params and 'views' not in params:
+             if 'text' in params:
+-                text = params["text"]
+-                image = self.pipeline_t2i(text)
++                params['image'] = self.pipeline_t2i(params["text"])
+             else:
+                 raise ValueError("No input image or text provided")
+-
+-        image = self.rembg(image)
++        image = self._prepare_images(params)
+         params['image'] = image
++        # the request-level keys this worker consumed; everything else reaches the pipeline as
++        # before (seed, octree_resolution, ..., and any unknown field, which it ignores)
++        for k in ("views", "model", "background_removed"):
++            params.pop(k, None)
+ 
+         if 'mesh' in params:
+             mesh = trimesh.load(BytesIO(base64.b64decode(params["mesh"])), file_type='glb')
+         else:
++            pipeline = self.ensure(name)
+             seed = params.get("seed", 1234)
+             params['generator'] = torch.Generator(self.device).manual_seed(seed)
              params['octree_resolution'] = params.get("octree_resolution", 128)
              params['num_inference_steps'] = params.get("num_inference_steps", 5)
              params['guidance_scale'] = params.get('guidance_scale', 5.0)
@@ -59,8 +338,10 @@ index b64e698..396825f 100644
 +            # which is not installed (no nvcc; Pascal sm_61 box). Overridable per-request.
 +            params['mc_algo'] = params.get('mc_algo', 'mc')
              start_time = time.time()
-             mesh = self.pipeline(**params)[0]
-             logger.info("--- %s seconds ---" % (time.time() - start_time))
+-            mesh = self.pipeline(**params)[0]
+-            logger.info("--- %s seconds ---" % (time.time() - start_time))
++            mesh = self._run(name, lambda: pipeline(**params)[0])
++            logger.info("--- %s seconds (%s) ---" % (time.time() - start_time, name))
 +            if mesh is None:
 +                # export_to_trimesh hands back None when marching cubes found no surface - at
 +                # 1-2 Euler steps of the non-turbo dit that is the normal outcome. Say what to
@@ -73,7 +354,7 @@ index b64e698..396825f 100644
  
          if params.get('texture', False):
              mesh = FloaterRemover()(mesh)
-@@ -219,11 +256,16 @@ class ModelWorker:
+@@ -219,15 +436,43 @@ class ModelWorker:
              mesh = self.pipeline_tex(mesh, image)
  
          type = params.get('type', 'glb')
@@ -95,39 +376,40 @@ index b64e698..396825f 100644
  
          torch.cuda.empty_cache()
          return save_path, uid
-@@ -243,58 +285,356 @@ app.add_middleware(
+ 
++    def imagine(self, uid, params):
++        """POST /imagine: Zero123-XL views of the input, published as <uid>.json atomically."""
++        name = params["model"]
++        image = self._prepare_images(params)
++        z = self.ensure(name)
++        start_time = time.time()
++        views = self._run(name, lambda: z.imagine(
++            image, params["views"], size=params["size"], steps=params["steps"],
++            guidance_scale=params["guidance_scale"], seed=params["seed"], elevation=params["elevation"]))
++        seconds = time.time() - start_time
++        logger.info("--- %.1f seconds (%s: %s at %d px, %d steps) ---", seconds, name, list(views), params["size"], params["steps"])
++        encoded = {}
++        for view, img in views.items():
++            buf = BytesIO()
++            img.save(buf, format="PNG")
++            encoded[view] = base64.b64encode(buf.getvalue()).decode()
++        result = {"kind": "views", "model": name, "views": encoded, "size": params["size"],
++                  "steps": params["steps"], "guidance_scale": params["guidance_scale"], "seed": params["seed"],
++                  "elevation": params["elevation"], "seconds": round(seconds, 1)}
++        save_path = publish_bytes(json.dumps(result).encode(), uid, "json")
++        torch.cuda.empty_cache()
++        return save_path, uid
++
+ 
+ app = FastAPI()
+ from fastapi.middleware.cors import CORSMiddleware
+@@ -243,58 +488,510 @@ app.add_middleware(
  
  @app.post("/generate")
  async def generate(request: Request):
 -    logger.info("Worker generating...")
 -    params = await request.json()
 -    uid = uuid.uuid4()
--    try:
--        file_path, uid = worker.generate(uid, params)
--        return FileResponse(file_path)
--    except ValueError as e:
--        traceback.print_exc()
--        print("Caught ValueError:", e)
--        ret = {
--            "text": server_error_msg,
--            "error_code": 1,
--        }
--        return JSONResponse(ret, status_code=404)
--    except torch.cuda.CudaError as e:
--        print("Caught torch.cuda.CudaError:", e)
--        ret = {
--            "text": server_error_msg,
--            "error_code": 1,
--        }
--        return JSONResponse(ret, status_code=404)
--    except Exception as e:
--        print("Caught Unknown Error", e)
--        traceback.print_exc()
--        ret = {
--            "text": server_error_msg,
--            "error_code": 1,
--        }
--        return JSONResponse(ret, status_code=404)
 +    # LOCAL PATCH (2026-09-02): the synchronous /generate ran worker.generate in the request
 +    # thread, OUTSIDE the single-flight queue below - a second entrance that could double-load
 +    # the card. Every generation goes through /send + /status now.
@@ -162,6 +444,12 @@ index b64e698..396825f 100644
 +#     recycles the worker instead of routing to it) and, unless HY3D_STUCK_EXIT=0, the process
 +#     exits 3 so start.sh takes the container down loudly. Before this, a hung CUDA call meant
 +#     /ping 200, 'processing' forever, then 429 forever, and nothing ever recycled the worker.
++#   * (2026-09-04) the body picks the MODEL: {"image"} -> the single-image default, {"views":
++#     {front, left?, back?, right?}} -> the multiview default, "model": "dit-v2-0" |
++#     "dit-v2-mv" | "dit-v2-mv-turbo" to choose; a views body on a single-image model, an
++#     unknown or unserved model, or a shape model on /imagine is a 400 naming the field.
++#     POST /imagine (Zero123-XL: {"image", "views": ["left","right","back"], "size", "steps"})
++#     rides the SAME queue, clamps and watchdog; its /status carries {"views": {name: b64 png}}.
 +QUEUE_MAX = max(0, int(os.environ.get("HY3D_QUEUE_MAX", "4")))
 +# seconds per outstanding job used for Retry-After (a 4090 does 30 steps at octree 384 in ~10 s;
 +# Pascal takes ~180 s - tune per host, it is only advice to the client)
@@ -169,7 +457,9 @@ index b64e698..396825f 100644
 +# wall-clock budget for ONE generation before the worker is declared wedged (0 = no budget).
 +# Default 900 s = the endpoint's request timeout; the largest job the validator admits (octree
 +# 512, 100 steps) is ~1.5 min on a 4090, ~6 min on Pascal-in-container, so 900 s is a hang,
-+# not a slow job. Raise it for a slow local rig rather than disabling it.
++# not a slow job. Raise it for a slow local rig rather than disabling it. A lazy model load
++# counts against the job that triggers it (weights come prefetched from the volume: seconds on
++# a 4090; the first-ever download on a fresh volume happens in start.sh, before any job).
 +JOB_MAX_S = max(0, int(os.environ.get("HY3D_JOB_MAX_S", "900")))
 +STUCK_EXIT = os.environ.get("HY3D_STUCK_EXIT", "1") != "0"   # exit 3 once wedged (default on)
 +# seconds the wedged process stays up (503 health, /status 'error', /send 503) before exit 3, so
@@ -179,7 +469,7 @@ index b64e698..396825f 100644
 +_JOBS_KEEP = 512                       # terminal records kept for /status before pruning
 +_UID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 +
-+_JOBS = {}                             # uid -> {"status", "seq", "error", "started_at"}
++_JOBS = {}                             # uid -> {"status", "seq", "error", "started_at", "kind"}
 +_JOBS_LOCK = threading.Lock()
 +_JOB_SEQ = 0
 +_QUEUE = queue.Queue()                 # (uid, params) FIFO for the single generation thread
@@ -196,6 +486,11 @@ index b64e698..396825f 100644
 +    "seed": (-(1 << 63), (1 << 64) - 1),
 +}
 +_FLOAT_RANGES = {"guidance_scale": (0.0, 30.0)}
++VIEW_KEYS = ("front", "left", "back", "right")        # hy3dgen MVImageProcessorV2.view2idx
++IMAGINE_VIEWS = ("left", "right", "back")             # what /imagine synthesizes (the input is the front)
++_IMAGINE_INT = {"size": (64, 512), "steps": (1, 200), "seed": _INT_RANGES["seed"]}
++_IMAGINE_FLOAT = {"guidance_scale": (0.0, 30.0), "elevation": (-90.0, 90.0)}
++_IMAGINE_DEFAULTS = {"size": 256, "steps": 75, "seed": 0, "guidance_scale": 3.0, "elevation": 0.0}
 +
 +
 +def _as_int(v):
@@ -224,35 +519,132 @@ index b64e698..396825f 100644
 +    return None
 +
 +
++def _check_ranges(clean, int_ranges, float_ranges):
++    for key, (lo, hi) in int_ranges.items():
++        if key in clean:
++            v = _as_int(clean[key])
++            if v is None:
++                return f"{key}: must be an integer"
++            if not lo <= v <= hi:
++                return f"{key}: must be within [{lo}, {hi}] (got {v})"
++            clean[key] = v
++    for key, (lo, hi) in float_ranges.items():
++        if key in clean:
++            v = _as_float(clean[key])
++            if v is None:
++                return f"{key}: must be a number"
++            if not lo <= v <= hi:
++                return f"{key}: must be within [{lo}, {hi}] (got {v})"
++            clean[key] = v
++    if "background_removed" in clean and not isinstance(clean["background_removed"], bool):
++        return "background_removed: must be true or false"
++    return None
++
++
++def _resolve_model(clean, want_kinds, default, route):
++    """(name, None) or (None, why): the canonical served model for this body - the explicit
++    'model' (an alias like 'dit-v2-mv' is fine) or `default` - checked against the kinds the
++    route can run. A model of the wrong kind names the other route."""
++    other = {"send": "POST /imagine", "imagine": "POST /send"}[route]
++    raw = clean.get("model")
++    if raw is not None:
++        if not isinstance(raw, str):
++            return None, "model: must be a string"
++        name = catalog.canonical(raw)
++        if name is None or name not in SERVED:
++            return None, f"model: unknown '{raw}' - served: {', '.join(SERVED)}"
++    else:
++        name = default
++        if name is None:
++            return None, (f"model: no {'/'.join(want_kinds)} model is served (served: {', '.join(SERVED)})")
++    kind = SERVED[name]["kind"]
++    if kind not in want_kinds:
++        what = {"single": "a single-image shape model", "mv": "a multiview shape model",
++                "nvs": "a view-synthesis model"}[kind]
++        return None, f"model: {name} is {what} - use {other}"
++    return name, None
++
++
 +def validate_params(params):
 +    """(clean_params, None) or (None, "field: why"). Null-valued keys count as absent."""
 +    if not isinstance(params, dict):
 +        return None, "body: a JSON object is required"
 +    clean = {k: v for k, v in params.items() if v is not None}
-+    if "image" not in clean and "mesh" not in clean:
-+        return None, "image: required (base64-encoded PNG/JPEG)"
-+    if "image" in clean and not (isinstance(clean["image"], str) and clean["image"].strip()):
++    has_image, has_views = "image" in clean, "views" in clean
++    if has_image and has_views:
++        return None, "views: send either 'image' (single view) or 'views' (multiview), not both"
++    if not has_image and not has_views and "mesh" not in clean:
++        return None, ("image: required (base64-encoded PNG/JPEG) - or 'views': {front, left, back, "
++                      "right: base64} for a multiview model")
++    if has_image and not (isinstance(clean["image"], str) and clean["image"].strip()):
 +        return None, "image: must be a non-empty base64 string"
-+    for key, (lo, hi) in _INT_RANGES.items():
-+        if key in clean:
-+            v = _as_int(clean[key])
-+            if v is None:
-+                return None, f"{key}: must be an integer"
-+            if not lo <= v <= hi:
-+                return None, f"{key}: must be within [{lo}, {hi}] (got {v})"
-+            clean[key] = v
-+    for key, (lo, hi) in _FLOAT_RANGES.items():
-+        if key in clean:
-+            v = _as_float(clean[key])
-+            if v is None:
-+                return None, f"{key}: must be a number"
-+            if not lo <= v <= hi:
-+                return None, f"{key}: must be within [{lo}, {hi}] (got {v})"
-+            clean[key] = v
++    if has_views:
++        views = clean["views"]
++        if not isinstance(views, dict) or not views:
++            return None, "views: must be a non-empty object {front|left|back|right: base64 PNG}"
++        bad = [k for k in views if k not in VIEW_KEYS]
++        if bad:
++            return None, f"views: unknown view(s) {bad} - the multiview slots are {', '.join(VIEW_KEYS)}"
++        for k, v in views.items():
++            if not (isinstance(v, str) and v.strip()):
++                return None, f"views: {k} must be a non-empty base64 string"
++    why = _check_ranges(clean, _INT_RANGES, _FLOAT_RANGES)
++    if why is not None:
++        return None, why
 +    if "mc_algo" in clean and clean["mc_algo"] not in ("mc", "dmc"):
 +        return None, "mc_algo: must be 'mc' or 'dmc'"
 +    if "type" in clean and clean["type"] != "glb":
 +        return None, "type: only 'glb' is served by /status"
++    if has_image or has_views:
++        default = DEFAULTS["views"] if has_views else DEFAULTS["image"]
++        name, why = _resolve_model(clean, ("single", "mv"), default, "send")
++        if why is not None:
++            return None, why
++        kind = SERVED[name]["kind"]
++        if has_views and kind != "mv":
++            mvs = [n for n, s in SERVED.items() if s["kind"] == "mv"]
++            return None, (f"model: {name} is a single-image model and has no view slots - send 'image', "
++                          f"or pick a multiview model ({', '.join(mvs) or 'none served'})")
++        if has_image and kind == "mv":
++            # a multiview model conditions on the front slot alone just fine
++            clean["views"] = {"front": clean.pop("image")}
++        clean["model"] = name
++    return clean, None
++
++
++def validate_imagine_params(params):
++    """(clean, None) or (None, "field: why") for POST /imagine."""
++    if not isinstance(params, dict):
++        return None, "body: a JSON object is required"
++    clean = {k: v for k, v in params.items() if v is not None}
++    if "image" not in clean:
++        return None, "image: required (base64-encoded PNG/JPEG - the front view to imagine the others from)"
++    if not (isinstance(clean["image"], str) and clean["image"].strip()):
++        return None, "image: must be a non-empty base64 string"
++    if "steps" not in clean and "num_inference_steps" in clean:
++        clean["steps"] = clean["num_inference_steps"]
++    for k, v in _IMAGINE_DEFAULTS.items():
++        clean.setdefault(k, v)
++    why = _check_ranges(clean, _IMAGINE_INT, _IMAGINE_FLOAT)
++    if why is not None:
++        return None, why
++    if clean["size"] % 8:
++        return None, f"size: must be a multiple of 8 (got {clean['size']})"
++    views = clean.get("views", list(IMAGINE_VIEWS))
++    if not isinstance(views, list) or not views:
++        return None, f"views: must be a non-empty list drawn from {list(IMAGINE_VIEWS)}"
++    seen = []
++    for v in views:
++        if not isinstance(v, str) or v not in IMAGINE_VIEWS:
++            return None, (f"views: unknown view {v!r} - /imagine synthesizes {', '.join(IMAGINE_VIEWS)} "
++                          "(the input image is the front)")
++        if v not in seen:
++            seen.append(v)
++    clean["views"] = seen
++    name, why = _resolve_model(clean, ("nvs",), DEFAULTS["imagine"], "imagine")
++    if why is not None:
++        return None, why
++    clean["model"] = name
 +    return clean, None
 +
 +
@@ -271,7 +663,8 @@ index b64e698..396825f 100644
 +
 +
 +def _generation_loop():
-+    """The ONLY place worker.generate runs: one job at a time, FIFO, state recorded honestly."""
++    """The ONLY place worker.generate / worker.imagine run: one job at a time, FIFO, state
++    recorded honestly."""
 +    while True:
 +        uid, params = _QUEUE.get()
 +        try:
@@ -281,8 +674,12 @@ index b64e698..396825f 100644
 +                    continue           # pruned, or failed by the watchdog while it waited
 +                job["status"] = "processing"
 +                job["started_at"] = time.monotonic()
++                kind = job.get("kind", "mesh")
 +            try:
-+                worker.generate(uid, params)
++                if kind == "views":
++                    worker.imagine(uid, params)
++                else:
++                    worker.generate(uid, params)
 +                _finish(uid, "completed", None)
 +            except KeyboardInterrupt:
 +                raise
@@ -308,6 +705,19 @@ index b64e698..396825f 100644
 +            job.update(status=status, error=error)
 +
 +
++def _model_state():
++    """What /queue and (through the gate) /ping say about the served models."""
++    w = globals().get("worker")
++    loaded = []
++    if w is not None and hasattr(w, "loaded"):
++        try:
++            loaded = list(w.loaded())
++        except Exception:       # noqa: BLE001
++            loaded = []
++    return {"models": list(SERVED), "loaded": loaded, "defaults": dict(DEFAULTS),
++            "model": LABELS.get("model", ""), "subfolder": LABELS.get("subfolder", "")}
++
++
 +def _health_locked(now):
 +    """The worker's honest state for /queue; caller holds _JOBS_LOCK."""
 +    in_flight, queued = _backlog_locked()
@@ -329,12 +739,14 @@ index b64e698..396825f 100644
 +    wd_age = None if last is None else max(0.0, now - last)
 +    wd_alive = (_WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive()
 +                and wd_age is not None and wd_age <= 3 * WATCHDOG_S)
-+    return {"in_flight": in_flight, "queued": queued, "queue_max": QUEUE_MAX,
-+            "loop_alive": loop_alive, "in_flight_age_s": None if age is None else round(age, 1),
-+            "job_max_s": JOB_MAX_S, "stuck": _STUCK is not None,
-+            "watchdog_alive": wd_alive, "watchdog_age_s": None if wd_age is None else round(wd_age, 1),
-+            "watchdog_tick_s": WATCHDOG_S,
-+            "healthy": reason is None, "reason": reason}
++    state = {"in_flight": in_flight, "queued": queued, "queue_max": QUEUE_MAX,
++             "loop_alive": loop_alive, "in_flight_age_s": None if age is None else round(age, 1),
++             "job_max_s": JOB_MAX_S, "stuck": _STUCK is not None,
++             "watchdog_alive": wd_alive, "watchdog_age_s": None if wd_age is None else round(wd_age, 1),
++             "watchdog_tick_s": WATCHDOG_S,
++             "healthy": reason is None, "reason": reason}
++    state.update(_model_state())
++    return state
 +
 +
 +def _watchdog():
@@ -393,23 +805,42 @@ index b64e698..396825f 100644
 +    _LOOP_THREAD = t
 +    start_watchdog()
 +    return t
- 
- 
- @app.post("/send")
--async def generate(request: Request):
--    logger.info("Worker send...")
--    params = await request.json()
--    uid = uuid.uuid4()
--    threading.Thread(target=worker.generate, args=(uid, params,)).start()
--    ret = {"uid": str(uid)}
--    return JSONResponse(ret, status_code=200)
-+async def send(request: Request):
++
++
++async def _enqueue(request, validator, kind):
++    """The one admission path for /send and /imagine: parse, validate, refuse when wedged or
++    full (503 / 429 + Retry-After), else record the job and queue it."""
 +    global _JOB_SEQ
-+    try:
+     try:
+-        file_path, uid = worker.generate(uid, params)
+-        return FileResponse(file_path)
+-    except ValueError as e:
+-        traceback.print_exc()
+-        print("Caught ValueError:", e)
+-        ret = {
+-            "text": server_error_msg,
+-            "error_code": 1,
+-        }
+-        return JSONResponse(ret, status_code=404)
+-    except torch.cuda.CudaError as e:
+-        print("Caught torch.cuda.CudaError:", e)
+-        ret = {
+-            "text": server_error_msg,
+-            "error_code": 1,
+-        }
+-        return JSONResponse(ret, status_code=404)
+-    except Exception as e:
+-        print("Caught Unknown Error", e)
+-        traceback.print_exc()
+-        ret = {
+-            "text": server_error_msg,
+-            "error_code": 1,
+-        }
+-        return JSONResponse(ret, status_code=404)
 +        params = await request.json()
 +    except Exception:
 +        return JSONResponse({"error": "body: invalid JSON", "field": "body"}, status_code=400)
-+    clean, why = validate_params(params)
++    clean, why = validator(params)
 +    if why is not None:
 +        return JSONResponse({"error": why, "field": why.split(":", 1)[0]}, status_code=400)
 +    uid = str(uuid.uuid4())
@@ -421,8 +852,8 @@ index b64e698..396825f 100644
 +        in_flight, queued = _backlog_locked()
 +        if in_flight + queued >= 1 + QUEUE_MAX:
 +            retry_after = max(5, (in_flight + queued) * JOB_ETA_S)
-+            logger.warning("Worker send: busy (in_flight=%d queued=%d max=%d) -> 429",
-+                           in_flight, queued, QUEUE_MAX)
++            logger.warning("Worker %s: busy (in_flight=%d queued=%d max=%d) -> 429",
++                           kind, in_flight, queued, QUEUE_MAX)
 +            return JSONResponse(
 +                {"status": "busy", "error": f"busy: 1 generation in flight and {queued} queued "
 +                                            f"(queue_max {QUEUE_MAX}); retry after {retry_after}s",
@@ -430,20 +861,47 @@ index b64e698..396825f 100644
 +                 "retry_after_s": retry_after},
 +                status_code=429, headers={"Retry-After": str(retry_after)})
 +        _JOB_SEQ += 1
-+        _JOBS[uid] = {"status": "queued", "seq": _JOB_SEQ, "error": None, "started_at": None}
++        _JOBS[uid] = {"status": "queued", "seq": _JOB_SEQ, "error": None, "started_at": None, "kind": kind}
 +        _prune_locked()
 +        position = queued + 1
 +    _QUEUE.put((uid, clean))
-+    logger.info("Worker send: uid %s queued (position %d, in_flight %d)", uid, position, in_flight)
-+    return JSONResponse({"uid": uid, "status": "queued", "position": position}, status_code=200)
++    logger.info("Worker %s: uid %s queued (model %s, position %d, in_flight %d)", kind, uid,
++                clean.get("model"), position, in_flight)
++    return JSONResponse({"uid": uid, "status": "queued", "position": position, "kind": kind,
++                         "model": clean.get("model")}, status_code=200)
+ 
+ 
+ @app.post("/send")
+-async def generate(request: Request):
+-    logger.info("Worker send...")
+-    params = await request.json()
+-    uid = uuid.uuid4()
+-    threading.Thread(target=worker.generate, args=(uid, params,)).start()
+-    ret = {"uid": str(uid)}
+-    return JSONResponse(ret, status_code=200)
++async def send(request: Request):
++    return await _enqueue(request, validate_params, "mesh")
++
++
++@app.post("/imagine")
++async def imagine(request: Request):
++    return await _enqueue(request, validate_imagine_params, "views")
 +
 +
 +def _completed_response(save_file_path):
 +    raw = open(save_file_path, 'rb').read()
 +    # size + sha256 beside the bytes: the gate cross-checks them before it latches a result for
 +    # ranged download (a mismatch is a 502, never a 'completed' with the wrong bytes)
-+    return JSONResponse({'status': 'completed', 'model_base64': base64.b64encode(raw).decode(),
++    return JSONResponse({'status': 'completed', 'kind': 'mesh', 'model_base64': base64.b64encode(raw).decode(),
 +                         'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}, status_code=200)
++
++
++def _views_response(save_file_path):
++    with open(save_file_path, 'rb') as f:
++        obj = json.load(f)
++    obj['status'] = 'completed'
++    obj.setdefault('kind', 'views')
++    return JSONResponse(obj, status_code=200)
  
  
  @app.get("/status/{uid}")
@@ -465,49 +923,55 @@ index b64e698..396825f 100644
 +        if snap is not None and snap["status"] == "queued":
 +            snap["position"] = 1 + sum(1 for j in _JOBS.values()
 +                                       if j["status"] == "queued" and j["seq"] < snap["seq"])
++    kind = (snap or {}).get("kind")
 +    # The RECORD decides while the job is alive (2026-09-03, verifier P2): 'completed' is what
 +    # the loop wrote AFTER generate() returned, never "a file exists at the path". The file is
 +    # published atomically (publish_result), so it cannot be half-written - but between the
 +    # rename and the record flip the honest answer is still 'processing' (one more poll).
 +    if snap is not None and snap["status"] == "queued":
-+        return JSONResponse({"status": "queued", "position": snap["position"]}, status_code=200)
++        return JSONResponse({"status": "queued", "position": snap["position"], "kind": kind}, status_code=200)
 +    if snap is not None and snap["status"] == "processing":
-+        return JSONResponse({"status": "processing"}, status_code=200)
-+    save_file_path = result_path(uid)
-+    if os.path.exists(save_file_path):
-+        # record 'completed' (file present, as before), 'error' (a late real completion of a job
-+        # the watchdog had failed - the bytes are whole, serve them), or pruned (the file is the
-+        # only witness left, and an atomically published file is a whole one)
-+        return _completed_response(save_file_path)
++        return JSONResponse({"status": "processing", "kind": kind}, status_code=200)
++    # record 'completed' (file present, as before), 'error' (a late real completion of a job
++    # the watchdog had failed - the bytes are whole, serve them), or pruned (the file is the
++    # only witness left, and an atomically published file is a whole one)
++    if kind in (None, "mesh") and os.path.exists(result_path(uid)):
++        return _completed_response(result_path(uid))
++    if kind in (None, "views") and os.path.exists(result_path(uid, "json")):
++        return _views_response(result_path(uid, "json"))
 +    if snap is None:
 +        return JSONResponse({"status": "not_found", "uid": uid}, status_code=404)
 +    if snap["status"] == "error":
-+        return JSONResponse({"status": "error", "error": snap["error"]}, status_code=200)
++        return JSONResponse({"status": "error", "error": snap["error"], "kind": kind}, status_code=200)
 +    # the record says done but the file is gone (cache wiped): terminal, not 'processing'
-+    return JSONResponse({"status": "error", "error": "result file missing"}, status_code=200)
++    return JSONResponse({"status": "error", "error": "result file missing", "kind": kind}, status_code=200)
 +
 +
 +@app.get("/queue")
 +async def queue_state():
 +    """Backlog + liveness: in_flight, queued, queue_max, loop_alive, in_flight_age_s, job_max_s,
-+    stuck, watchdog_alive, watchdog_age_s, watchdog_tick_s, healthy, reason. auth_gate's health
-+    path reads `healthy` (503 when false) and the watchdog fields (503 when dead/stalled)."""
++    stuck, watchdog_alive, watchdog_age_s, watchdog_tick_s, healthy, reason - plus the served
++    models: models, loaded, defaults, model, subfolder. auth_gate's health path reads `healthy`
++    (503 when false), the watchdog fields (503 when dead/stalled) and copies the model fields."""
 +    with _JOBS_LOCK:
 +        return JSONResponse(_health_locked(time.monotonic()))
  
  
  if __name__ == "__main__":
-@@ -306,11 +646,18 @@ if __name__ == "__main__":
+@@ -306,11 +1003,21 @@ if __name__ == "__main__":
      parser.add_argument("--device", type=str, default="cuda")
      parser.add_argument("--limit-model-concurrency", type=int, default=5)
      parser.add_argument('--enable_tex', action='store_true')
 +    parser.add_argument('--subfolder', type=str, default='hunyuan3d-dit-v2-mini-turbo',
-+                        help="dit subfolder: hunyuan3d-dit-v2-mini-turbo (5-step distill, default) "
-+                             "or hunyuan3d-dit-v2-mini (NON-turbo, more steps -> more real detail)")
++                        help="dit subfolder of the single-image default: hunyuan3d-dit-v2-mini-turbo "
++                             "(5-step distill), hunyuan3d-dit-v2-mini (NON-turbo), or hunyuan3d-dit-v2-0 "
++                             "(the full model, with --model_path tencent/Hunyuan3D-2); HY3D_MODELS adds "
++                             "the multiview dits and zero123-xl (see hy3d_models.py)")
      args = parser.parse_args()
      logger.info(f"args: {args}")
  
      model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
++    configure_models(args.model_path, args.subfolder)
  
      worker = ModelWorker(model_path=args.model_path, device=args.device, enable_tex=args.enable_tex,
 -                         tex_model_path=args.tex_model_path)
@@ -515,8 +979,8 @@ index b64e698..396825f 100644
 +                         tex_model_path=args.tex_model_path, subfolder=args.subfolder)
 +    start_generation_loop()
 +    logger.info("single-flight generation queue up: 1 in flight, %d queued max; watchdog: "
-+                "job budget %ds, tick %ds, exit on wedge %s (grace %ds)", QUEUE_MAX, JOB_MAX_S,
-+                WATCHDOG_S, STUCK_EXIT, STUCK_EXIT_GRACE_S)
++                "job budget %ds, tick %ds, exit on wedge %s (grace %ds); serving %s (loaded %s)",
++                QUEUE_MAX, JOB_MAX_S, WATCHDOG_S, STUCK_EXIT, STUCK_EXIT_GRACE_S, list(SERVED), worker.loaded())
 +    uvicorn.run(app, host=args.host, port=int(args.port), log_level="info")
 diff --git a/hy3dgen/shapegen/models/autoencoders/volume_decoders.py b/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
 index d7bfd84..0afbff1 100644

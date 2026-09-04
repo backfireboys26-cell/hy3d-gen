@@ -12,6 +12,11 @@ UPSTREAM_PORT="${UPSTREAM_PORT:-8081}"
 MODEL_PATH="${MODEL_PATH:-tencent/Hunyuan3D-2mini}"
 SUBFOLDER="${HY3D_SUBFOLDER:-hunyuan3d-dit-v2-mini-turbo}"
 DEVICE="${HY3D_DEVICE:-cuda}"
+export MODEL_PATH HY3D_SUBFOLDER="${SUBFOLDER}"
+# the ONE catalog of served models (repo/subfolder/kind/VRAM + the cache check and prefetch);
+# api_server.py imports it, this script shells out to its CLI - never a second mapping here
+MODELS_PY="${HY3D_MODELS_PY:-/app/hy3d_models.py}"
+[[ -f "${MODELS_PY}" ]] || MODELS_PY="$(dirname "$0")/hy3d_models.py"
 
 # The weight cache MUST land on the persistent volume. A missing mount used to be silently
 # papered over by mkdir on the ephemeral disk: every cold start re-downloaded, the paid volume
@@ -23,63 +28,47 @@ if [[ "${HF_ROOT}" == /runpod-volume/* ]] && ! mountpoint -q /runpod-volume 2>/d
     echo "FATAL: /runpod-volume is not mounted - weights would land on ephemeral disk (set HY3D_ALLOW_EPHEMERAL_CACHE=1 to override)" >&2
     exit 3
 fi
+export HF_HOME="${HF_ROOT}"
 mkdir -p "${HF_ROOT}"
 # rembg's u2net.onnx (~176 MB) is fetched from GitHub on first use; keep it on the volume too,
 # so a cold start neither re-downloads it nor dies on a GitHub hiccup (audit #10).
 export U2NET_HOME="${U2NET_HOME:-${HF_ROOT}/u2net}"
 mkdir -p "${U2NET_HOME}"
 
+# Which models this worker serves (the single-image default + HY3D_MODELS). An unknown name is
+# fatal HERE, before any weight is touched, naming it - never a worker that boots serving fewer
+# models than the operator asked for.
+if ! SERVED_JSON="$(python "${MODELS_PY}" list 2>&1)"; then
+    echo "FATAL: ${SERVED_JSON}" >&2
+    exit 3
+fi
+echo "[start] serving: ${SERVED_JSON}"
+
 # HF offline mode, self-proving (audit 2026-09-02, endpoint hygiene "HF_HUB_OFFLINE=1 only if
-# the volume is proven complete"): go offline ONLY when every hub file the loader will open is
-# already in the cache - the dit subfolder's config.yaml + model.fp16.safetensors and the turbo
-# VAE the pipeline swaps in (enable_flashvdm), both under the repo's refs/main snapshot. Then
-# huggingface_hub / transformers never touch huggingface.co at boot: no per-file HEAD calls, no
-# dependence on the hub being up. Anything missing -> stay online and SAY which path, so a fresh
-# volume still self-populates (proven by ../tests/test-start-sh.sh case B: empty cache ->
-# 'incomplete' line AND the api_server boots). An operator-set HF_HUB_OFFLINE (0 or 1) always
-# wins. The image encoder is built from the config inline in config.yaml (no hub repo), rembg's
-# u2net comes from GitHub via U2NET_HOME (not an HF call) - so these two paths are the whole
-# hub surface.
-case "${MODEL_PATH##*/}" in
-    Hunyuan3D-2|Hunyuan3D-2mv) VAE_REPO="tencent/Hunyuan3D-2";     VAE_SUBFOLDER="hunyuan3d-vae-v2-0-turbo" ;;
-    Hunyuan3D-2mini)           VAE_REPO="tencent/Hunyuan3D-2mini"; VAE_SUBFOLDER="hunyuan3d-vae-v2-mini-turbo" ;;
-    *)                         VAE_REPO="";                         VAE_SUBFOLDER="" ;;
-esac
-hf_snapshot_dir() {  # <repo_id> -> the refs/main snapshot dir, or nothing; ALWAYS status 0
-    # (a non-zero return propagates through snap="$(...)" and, under errexit, kills the script
-    # before the 'incomplete' branch is reached - the 2026-09-02 empty-volume regression)
-    local repo_dir="${HF_ROOT}/hub/models--${1//\//--}" rev
-    rev="$(cat "${repo_dir}/refs/main" 2>/dev/null || true)"
-    if [[ -n "${rev}" && -d "${repo_dir}/snapshots/${rev}" ]]; then
-        echo "${repo_dir}/snapshots/${rev}"
-    fi
-    return 0
-}
+# the volume is proven complete"): go offline ONLY when every hub file the loaders will open is
+# already in the cache - for EVERY served model (each dit subfolder's config.yaml +
+# model.fp16.safetensors, the turbo VAE enable_flashvdm swaps in, and zero123-xl's components).
+# hy3d_models.py owns that file list; this script only reads its verdict. Then huggingface_hub /
+# transformers never touch huggingface.co at boot. Anything missing -> PREFETCH it (so a fresh
+# volume self-populates BEFORE the first job, instead of a multi-GB download landing inside one
+# job's HY3D_JOB_MAX_S budget), then re-check; whatever is still missing is named and the worker
+# boots ONLINE so the lazy loaders can still fetch it. HY3D_PREFETCH=0 skips the prefetch (the
+# old lazy behaviour); an operator-set HF_HUB_OFFLINE (0 or 1) always wins over all of it.
+cache_check() { python "${MODELS_PY}" check 2>&1 || true; }
 if [[ -n "${HF_HUB_OFFLINE:-}" ]]; then
     echo "[start] HF_HUB_OFFLINE=${HF_HUB_OFFLINE} set by operator - honoring it"
 else
-    missing=""
-    snap="$(hf_snapshot_dir "${MODEL_PATH}")"
-    for f in config.yaml model.fp16.safetensors; do
-        if [[ -z "${snap}" || ! -s "${snap}/${SUBFOLDER}/${f}" ]]; then
-            missing="${missing} ${MODEL_PATH}/${SUBFOLDER}/${f}"
-        fi
-    done
-    if [[ -n "${VAE_REPO}" ]]; then
-        vsnap="$(hf_snapshot_dir "${VAE_REPO}")"
-        for f in config.yaml model.fp16.safetensors; do
-            if [[ -z "${vsnap}" || ! -s "${vsnap}/${VAE_SUBFOLDER}/${f}" ]]; then
-                missing="${missing} ${VAE_REPO}/${VAE_SUBFOLDER}/${f}"
-            fi
-        done
-    else
-        missing="${missing} (unknown VAE mapping for ${MODEL_PATH})"
+    STATUS="$(cache_check)"
+    if [[ "${STATUS}" != COMPLETE* && "${HY3D_PREFETCH:-1}" == "1" ]]; then
+        echo "[start] HF cache incomplete, prefetching before serving; missing: ${STATUS#MISSING }"
+        python "${MODELS_PY}" prefetch || echo "[start] prefetch exited non-zero - continuing with what is cached" >&2
+        STATUS="$(cache_check)"
     fi
-    if [[ -z "${missing}" ]]; then
+    if [[ "${STATUS}" == COMPLETE* ]]; then
         export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-        echo "[start] HF cache complete under ${HF_ROOT} (${SUBFOLDER} + ${VAE_SUBFOLDER}) -> HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"
+        echo "[start] HF cache complete under ${HF_ROOT} (${STATUS#COMPLETE }) -> HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"
     else
-        echo "[start] HF cache incomplete, staying ONLINE; missing:${missing}"
+        echo "[start] HF cache incomplete, staying ONLINE; missing: ${STATUS#MISSING }"
     fi
 fi
 if [[ -s "${U2NET_HOME}/u2net.onnx" ]]; then

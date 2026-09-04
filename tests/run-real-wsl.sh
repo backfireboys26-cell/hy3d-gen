@@ -7,7 +7,8 @@
 # /runpod-volume), HY3D_HF=/runpod-volume/forge-hf (HF_HOME), HY3D_MODEL=tencent/Hunyuan3D-2,
 # HY3D_SUB=hunyuan3d-dit-v2-0 (the endpoint's model), UPSTREAM_PORT=18081 (host networking shares
 # the Windows port space, :8081 is the local generator), GATE_PORT=8080.
-# overlay=1 bind-mounts THIS tree's docker/start.sh + docker/auth_gate.py and a patched api_server.py
+# overlay=1 bind-mounts THIS tree's docker/start.sh + docker/auth_gate.py + docker/hy3d_models.py +
+# docker/zero123/ and a patched api_server.py
 # (env HY3D_API_SERVER=<path>, default: apply patches/rsv4-stack.patch to a fresh f2456e0 clone of
 # HY3D_UPSTREAM_GIT, default /mnt/c/ai3d/Hunyuan3D-2GP) over the image's copies.
 # HF_ENDPOINT is black-holed: if the boot were to make any hub call it would fail loudly.
@@ -26,7 +27,8 @@ MOUNTS=()
 if [[ "$OVERLAY" == "1" ]]; then
     STAGE="${HY3D_STAGE:-/srv/hy3d-stage}"
     mkdir -p "$STAGE"
-    cp "$GEN/docker/auth_gate.py" "$GEN/docker/start.sh" "$STAGE/"
+    cp "$GEN/docker/auth_gate.py" "$GEN/docker/start.sh" "$GEN/docker/hy3d_models.py" "$STAGE/"
+    rm -rf "$STAGE/zero123"; cp -r "$GEN/docker/zero123" "$STAGE/zero123"
     if [[ -n "${HY3D_API_SERVER:-}" ]]; then
         cp "$HY3D_API_SERVER" "$STAGE/api_server.py"
     else
@@ -40,9 +42,12 @@ if [[ "$OVERLAY" == "1" ]]; then
     fi
     sed -i 's/\r$//' "$STAGE"/*.py "$STAGE"/*.sh
     chmod +x "$STAGE/start.sh"
-    sha256sum "$STAGE"/api_server.py "$STAGE"/auth_gate.py "$STAGE"/start.sh
+    sha256sum "$STAGE"/api_server.py "$STAGE"/auth_gate.py "$STAGE"/hy3d_models.py \
+              "$STAGE"/start.sh "$STAGE"/zero123/nvs.py
     MOUNTS=(-v "$STAGE/api_server.py:/app/api_server.py:ro"
             -v "$STAGE/auth_gate.py:/app/auth_gate.py:ro"
+            -v "$STAGE/hy3d_models.py:/app/hy3d_models.py:ro"
+            -v "$STAGE/zero123:/app/zero123:ro"
             -v "$STAGE/start.sh:/app/start.sh:ro")
 fi
 docker run -d --name "$NAME" --network=host --runtime=nvidia --gpus all \

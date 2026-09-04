@@ -1,8 +1,8 @@
 ---
 name: forge-generation-docker
-description: The deployable FORGE generation container (patched Hunyuan3D-2GP + stdlib auth gate) - build/run commands for WSL2 and the RunPod LOAD_BALANCER endpoint it targets.
+description: The deployable FORGE generation container - one worker serving the single-view dit, both multiview dits and Zero123-XL view synthesis behind one queue, plus the stdlib auth gate; build/run commands for WSL2 and the RunPod LOAD_BALANCER endpoint it targets.
 type: reference
-updated: 2026-09-03
+updated: 2026-09-04
 ---
 
 # FORGE generation container (pillar-3 Phase B)
@@ -12,13 +12,37 @@ GPU host. One image serves the whole `POST /send` / `GET /status/{uid}` contract
 `generate3d.py` speaks - point `GEN3D_ENDPOINT` at wherever it runs (a local container, a
 RunPod endpoint) and the client is identical.
 
+**One worker, every model (2026-09-04).** The same process serves the single-view dit named by
+`MODEL_PATH`/`HY3D_SUBFOLDER`, the full multiview `tencent/Hunyuan3D-2mv` (`hunyuan3d-dit-v2-mv`),
+its step-distilled twin (`hunyuan3d-dit-v2-mv-turbo`) and Zero123-XL view synthesis - selected
+**per request**, loaded lazily, kept resident, evicted least-recently-used when the card cannot
+hold another (a 24 GB 4090 holds all four, ~19 GB; an 8 GB Pascal holds one at a time, and every
+eviction is logged with the free/needed numbers). `HY3D_MODELS` picks the set; `hy3d_models.py`
+is the ONE catalog of which repo/subfolder/files each model is - `api_server.py` imports it and
+`start.sh` shells out to its `check`/`prefetch` CLI, so the offline decision and the model list
+can never drift apart.
+
+| Body | Runs |
+|---|---|
+| `POST /send {"image": <b64>}` | the single-view dit (`HY3D_SUBFOLDER`) |
+| `POST /send {"views": {"front": <b64>, "left"?, "back"?, "right"?}}` | `hunyuan3d-dit-v2-mv` |
+| either, plus `"model": "dit-v2-0" \| "dit-v2-mv" \| "dit-v2-mv-turbo"` | that model (short aliases and full names both work) |
+| `POST /send {"image"}` with an mv model | that model, the image filling the FRONT slot |
+| `POST /imagine {"image": <b64>, "views": ["left","right","back"], "size": 256, "steps": 75}` | Zero123-XL; `/status/{uid}` -> `{"status":"completed","kind":"views","views":{"left": <b64 png>, ...}}` |
+
+Every one of them rides the SAME single-flight queue, clamps, watchdog, atomic publish and
+record-gated `/status` as before - a `/imagine` call while `/send` has filled the queue is the
+same `429` + `Retry-After`.
+
 ## Contents
 
 | File | Job |
 |---|---|
 | `Dockerfile` | python:3.12-slim + torch 2.5.1 cu124 wheels + Hunyuan3D-2GP @ `f2456e0` + the vaulted container requirements under TWO constraint files + `rsv4-stack.patch` (applied after pip so a patch change rebuilds from cache). Weights NOT baked (`HF_HOME`, default `/runpod-volume/hf`). |
 | `constraints.txt` | every package of the published image, pinned (`pip freeze` of `cu124-20260902b`, torch flavor left to the index). Regenerate from a built image when a dependency is deliberately moved. |
-| `auth_gate.py` | stdlib-only front door on `$PORT`: bearer auth (only when `HY3D_TOKEN` set), honest `$HEALTH_CHECK_PATH` (204 while the api_server socket is not yet accepting = weights loading; 200 once it serves AND its `/queue` says `healthy:true`; **503 `{"status":"unhealthy","reason"}` when `/queue` says `healthy:false`** - a job past `HY3D_JOB_MAX_S` or a dead loop - **or when the api_server's watchdog is dead / has not ticked for 3 ticks** - so the load balancer recycles a wedged worker), reverse proxy to the loopback api_server; passes 400/404/429 (+`Retry-After`) through verbatim, caches nothing but decoded results for ranged download - and latches one only when the api_server's declared `size`/`sha256` match the bytes (a mismatch is a 502). Every early answer (401, health, bad `Content-Length`) drains the request body first so a keep-alive connection stays in sync (round 3). |
+| `hy3d_models.py` | the ONE model catalog: name -> repo/subfolder/kind/VRAM, the files each model opens, the served set from `MODEL_PATH` + `HY3D_MODELS`, the `/ping` label strings, and the `list` / `check` / `prefetch` CLI `start.sh` runs (stdlib-only at import, so it answers before the ML stack is touched). |
+| `zero123/` | the `POST /imagine` loader: `nvs.py` (manual component assembly from `kxic/zero123-xl`, fp16, attention slicing, no xformers) plus the diffusers-0.32.2 community `pipeline_zero1to3.py` and the torch-only `kornia.py` shim it needs beside it - `kornia` is deliberately not a pin. |
+| `auth_gate.py` | stdlib-only front door on `$PORT`: bearer auth (only when `HY3D_TOKEN` set), honest `$HEALTH_CHECK_PATH` (204 while the api_server socket is not yet accepting = weights loading; 200 once it serves AND its `/queue` says `healthy:true`, with `models` = every served model and `loaded` = the ones resident right now, copied from `/queue`; **503 `{"status":"unhealthy","reason"}` when `/queue` says `healthy:false`** - a job past `HY3D_JOB_MAX_S` or a dead loop - **or when the api_server's watchdog is dead / has not ticked for 3 ticks** - so the load balancer recycles a wedged worker), reverse proxy to the loopback api_server; passes 400/404/429 (+`Retry-After`) through verbatim, caches nothing but decoded results for ranged download - and latches one only when the api_server's declared `size`/`sha256` match the bytes (a mismatch is a 502). Every early answer (401, health, bad `Content-Length`) drains the request body first so a keep-alive connection stays in sync (round 3). |
 | `start.sh` | runs api_server on `127.0.0.1:$UPSTREAM_PORT` + auth_gate on `$PORT`; either process dying kills the container, loudly (an ERR trap names the line; nothing exits silently). Refuses to start without `/runpod-volume`; keeps u2net on the volume; sets `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` by itself when the cache already holds the dit + turbo-VAE snapshot, and on an EMPTY or partial cache logs `HF cache incomplete, staying ONLINE; missing: <paths>` and boots online so the volume self-populates (`../tests/test-start-sh.sh` case B - the 2026-09-02 round-1 copy died here with exit 1 and no output). |
 | `../tests/` | the no-GPU contract tests (`harness.py` with a stubbed pipeline, `test-start-sh.sh` against a real image); baked into the image at `/app/tests`. See `../tests/README.md`. |
 
@@ -32,7 +56,13 @@ RunPod endpoint) and the client is identical.
 | `HY3D_TOKEN` | *(unset)* | bearer token. **Unset = OPEN** (local test mode). Set at runtime only - never baked, never in the vault (DPAPI store name on the client side: `gen3d_endpoint_token`) |
 | `HF_HOME` | `/runpod-volume/hf` | weight cache - point at the mounted volume; first warm run downloads once |
 | `MODEL_PATH` | `tencent/Hunyuan3D-2mini` | HF model repo |
-| `HY3D_SUBFOLDER` | `hunyuan3d-dit-v2-mini-turbo` | dit subfolder (`hunyuan3d-dit-v2-0` on `tencent/Hunyuan3D-2` for the quality model) |
+| `HY3D_SUBFOLDER` | `hunyuan3d-dit-v2-mini-turbo` | dit subfolder of the SINGLE-VIEW default (`hunyuan3d-dit-v2-0` on `tencent/Hunyuan3D-2` for the quality model) |
+| `HY3D_MODELS` | `dit-v2-0,dit-v2-mv,dit-v2-mv-turbo,zero123-xl` | the models served BESIDE that default, comma-separated (catalog names or short aliases). Empty = the single-view model alone. An unknown name is fatal at boot, naming it |
+| `HY3D_PRELOAD` | *(the single-view default)* | models loaded BEFORE the server listens (health stays 204 meanwhile); `none` = everything lazy |
+| `HY3D_MAX_LOADED` | `4` | pipelines resident at once before an LRU eviction |
+| `HY3D_VRAM_MARGIN_MB` | `2048` | activation headroom required free on top of a model's weights before it loads; short of it, the LRU resident is evicted (logged with the numbers) |
+| `HY3D_PREFETCH` | `1` | on an incomplete cache, download the missing weights BEFORE serving (so a multi-GB fetch never lands inside one job's `HY3D_JOB_MAX_S`), then re-check; `0` = the old lazy behaviour |
+| `HY3D_ZERO123_DIR` | `<api_server dir>/zero123` | where the `/imagine` loader and its two support files live |
 | `HY3D_DEVICE` | `cuda` | `cpu` for GPU-less contract tests (WSL) |
 | `UPSTREAM_PORT` | `8081` | loopback port the api_server binds inside the container |
 | `HY3D_QUEUE_MAX` | `4` | jobs the api_server queues behind the ONE in flight (matches the endpoint's REQUEST_COUNT 4); the next `/send` is a 429 |
@@ -50,13 +80,17 @@ RunPod endpoint) and the client is identical.
 
 | Call | Answer |
 |---|---|
-| `POST /send` valid body | `200 {"uid", "status":"queued", "position"}` - ONE generation runs at a time; up to `HY3D_QUEUE_MAX` wait FIFO |
+| `POST /send` valid body | `200 {"uid", "status":"queued", "position", "kind":"mesh", "model"}` - ONE generation runs at a time; up to `HY3D_QUEUE_MAX` wait FIFO; `model` echoes which model the body selected |
+| `POST /imagine` valid body | `200 {"uid", "status":"queued", "position", "kind":"views", "model":"zero123-xl"}` - the SAME queue as `/send` (a `/imagine` behind a full queue is the same 429) |
+| `GET /status/{uid}` of an `/imagine` job | `200 {"status":"completed","kind":"views","views":{"left": <b64 png>, ...},"size","steps","guidance_scale","seed","elevation","seconds"}` - published atomically as `<uid>.json`, record-gated exactly like a mesh |
+| `POST /send {"views"}` with a single-image `model`, an unknown `model`, a shape model on `/imagine` (or the reverse), both `image` and `views`, an unknown view slot, an empty `views` object | `400 {"error":"<field>: <why>", "field":"model"\|"views"\|...}` naming the field and the route that WOULD serve it |
+| `POST /imagine` with `views` outside `left/right/back`, `size` not a multiple of 8 or outside 64..512, `steps` outside 1..200, `elevation` outside -90..90 | `400` naming the field |
 | `POST /send` when 1 in flight + `HY3D_QUEUE_MAX` queued | `429` + `Retry-After: <s>` + `{"status":"busy","in_flight","queued","queue_max","retry_after_s"}` |
 | `POST /send` with `octree_resolution` outside 64..512, `num_inference_steps` outside 1..100, `guidance_scale` outside 0..30, a non-integer `seed`, no `image`, `mc_algo` not mc/dmc, `type` not glb, or a non-object body | `400 {"error":"<field>: <why>", "field":"<field>"}` - unknown fields are ignored, never fatal |
 | `GET /status/{uid}` | `200 {"status":"queued","position"}` / `{"status":"processing"}` / `{"status":"error","error"}` / `{"status":"completed","model_base64","size","sha256"}` (or the gate's `download` handle over 16 MiB). **The job record decides while a job is queued/processing** - the result file is published atomically (`<uid>.glb.partial` -> `os.replace` -> `<uid>.glb`, same filesystem) and `completed` is answered only once the loop recorded it (or the record was pruned and the whole file is the witness); a file at the final path never turns a running job into `completed` (round 3, verifier P2) |
 | `GET /status/{uid}` for a uid this worker never accepted | `404 {"status":"not_found"}` - a replaced worker fails the client in one poll instead of burning its timeout |
 | `GET /status/{uid}` for a job that extracted no surface (1-2 steps of the non-turbo dit) | `200 {"status":"error","error":"RuntimeError: no surface extracted at N steps / octree M (the pipeline returned no mesh) - raise num_inference_steps (>= 5 on the non-turbo dit) or try another seed"}` |
-| `GET /queue` | `{"in_flight","queued","queue_max","loop_alive","in_flight_age_s","job_max_s","stuck","watchdog_alive","watchdog_age_s","watchdog_tick_s","healthy","reason"}` - `healthy:false` (+`reason`) once a job outlives `HY3D_JOB_MAX_S` or the loop thread died; the gate turns that into a 503 health, and also 503s when `watchdog_alive` is false or `watchdog_age_s` > 3 x `watchdog_tick_s` |
+| `GET /queue` | `{"in_flight","queued","queue_max","loop_alive","in_flight_age_s","job_max_s","stuck","watchdog_alive","watchdog_age_s","watchdog_tick_s","healthy","reason","models","loaded","defaults","model","subfolder"}` - `healthy:false` (+`reason`) once a job outlives `HY3D_JOB_MAX_S` or the loop thread died; the gate turns that into a 503 health, and also 503s when `watchdog_alive` is false or `watchdog_age_s` > 3 x `watchdog_tick_s` |
 | any request without a valid token (gate with `HY3D_TOKEN` set) | `401` - the body is drained first, so the next request on the same keep-alive connection is parsed cleanly (a body over `GATE_DRAIN_MAX` gets `Connection: close`) |
 | any request while wedged | `/status/<every outstanding uid>` -> `error` naming the budget; `POST /send` -> `503 {"status":"unhealthy","error"}`; `/ping` -> 503; then (default) the process exits 3 after `HY3D_STUCK_EXIT_GRACE_S` and start.sh takes the container down |
 | a `SystemExit`/`BaseException` inside `generate()` | recorded as `status:error` naming it; the loop thread survives and the next job runs |
@@ -96,8 +130,22 @@ host:
 
 ```powershell
 $env:GEN3D_ENDPOINT = "http://localhost:8080"
+# single view (the model named by HY3D_SUBFOLDER)
 engine\forge-scripts\parts\.venv\Scripts\python.exe engine\forge-scripts\generate3d.py `
   --image front.png --out-dir out --seeds 101 --octree 128 --no-render --no-anatomy
+# multiview: --side routes to the views body, and the client's POSITIVE mv guard passes because
+# /ping now NAMES the mv model in both 'model' and 'subfolder'
+engine\forge-scripts\parts\.venv\Scripts\python.exe engine\forge-scripts\generate3d.py `
+  --image front.png --side side.png --out-dir out-mv --seeds 101 --octree 256 --no-render --no-anatomy
+```
+
+Zero123-XL view synthesis has no client flag yet - it is one HTTP call (header names only; the
+token header is only needed when `HY3D_TOKEN` is set):
+
+```bash
+curl -s -X POST "$GEN3D_ENDPOINT/imagine" -H 'Content-Type: application/json' -H 'X-HY3D-Token: <token>' \
+     -d '{"image":"<base64 png>","views":["left","right","back"],"size":256,"steps":75}'   # -> {"uid": ...}
+curl -s "$GEN3D_ENDPOINT/status/<uid>" -H 'X-HY3D-Token: <token>'                          # -> {"status":"completed","views":{...}}
 ```
 
 ## Image tags
@@ -127,7 +175,10 @@ exact field names at deploy time):
       "PORT_HEALTH": "8080",
       "HEALTH_CHECK_PATH": "/ping",
       "HY3D_TOKEN": "<value of DPAPI secret gen3d_endpoint_token - runtime env only>",
-      "HF_HOME": "/runpod-volume/hf"
+      "HF_HOME": "/runpod-volume/hf",
+      "MODEL_PATH": "tencent/Hunyuan3D-2",
+      "HY3D_SUBFOLDER": "hunyuan3d-dit-v2-0",
+      "HY3D_MODELS": "dit-v2-0,dit-v2-mv,dit-v2-mv-turbo,zero123-xl"
     }
   },
   "gpuTypeIds": ["ADA_24"],             // 4090 pool, $1.10/hr active

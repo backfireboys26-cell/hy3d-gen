@@ -31,7 +31,10 @@ balancer traffic into a still-loading worker.
   (e) health follows RunPod's contract: 204 (empty) while the api_server is still loading =
       "initializing", 200 = healthy; anything else is read as UNHEALTHY and a worker that
       is unhealthy for its whole first weight download gets terminated and relaunched (billed).
-      The 200 body names the served model so a client can pick its step ladder honestly.
+      The 200 body names EVERY served model - "models" (all of them) and "loaded" (the
+      ones resident on the card right now), read from the api_server's /queue, plus the
+      "model"/"subfolder" keys the 2026-09-03 generate3d.py reads for its multiview guard and
+      its step ladder - so a client can pick its model and its ladder honestly.
       Health is NOT blind to the generation loop (2026-09-02 fix round): once the socket
       accepts, the gate reads the api_server's GET /queue and answers 503 {"status":
       "unhealthy","reason":...} when it reports healthy:false - a job past HY3D_JOB_MAX_S or a
@@ -127,6 +130,25 @@ def upstream_queue_state():
         return None
 
 
+def model_fields(state):
+    """The model-naming half of every health body: `models` (every model this worker serves) and
+    `loaded` (the ones resident right now) come from the api_server's own /queue - it is the only
+    holder of that truth - while `model`/`subfolder` keep naming the served repos/subfolders for
+    the 2026-09-03 generate3d.py, whose multiview guard and step ladder read exactly those two
+    keys. The env values are the fallback for an unreadable /queue (or an older api_server that
+    does not report them), so health never goes silent about what it serves."""
+    fields = {"model": MODEL_PATH, "subfolder": SUBFOLDER}
+    if isinstance(state, dict):
+        for key in ("model", "subfolder"):
+            v = state.get(key)
+            if isinstance(v, str) and v.strip():
+                fields[key] = v
+        for key in ("models", "loaded", "defaults"):
+            if key in state:
+                fields[key] = state[key]
+    return fields
+
+
 def health_verdict():
     """(http_code, body_or_None) for the health path - see docstring (e)."""
     if not upstream_listening():
@@ -138,20 +160,20 @@ def health_verdict():
         if since is None:
             _unreadable_since[0] = since = now
         if now - since > HEALTH_UNREADABLE_MAX_S:
-            return 503, {"status": "unhealthy", "model": MODEL_PATH, "subfolder": SUBFOLDER,
+            return 503, {"status": "unhealthy", **model_fields(None),
                          "reason": f"api_server /queue unreadable for {now - since:.0f}s "
                                    f"(> HEALTH_UNREADABLE_MAX_S={HEALTH_UNREADABLE_MAX_S:.0f})"}
-        return 200, {"status": "ok", "model": MODEL_PATH, "subfolder": SUBFOLDER, "queue": "unreadable"}
+        return 200, {"status": "ok", **model_fields(None), "queue": "unreadable"}
     _unreadable_since[0] = None
     if state.get("healthy") is False:
-        return 503, {"status": "unhealthy", "model": MODEL_PATH, "subfolder": SUBFOLDER,
+        return 503, {"status": "unhealthy", **model_fields(state),
                      "reason": state.get("reason") or "api_server reports healthy:false",
                      "queue": state}
     stalled = watchdog_stalled(state)
     if stalled:
-        return 503, {"status": "unhealthy", "model": MODEL_PATH, "subfolder": SUBFOLDER,
+        return 503, {"status": "unhealthy", **model_fields(state),
                      "reason": stalled, "queue": state}
-    return 200, {"status": "ok", "model": MODEL_PATH, "subfolder": SUBFOLDER, "queue": state}
+    return 200, {"status": "ok", **model_fields(state), "queue": state}
 
 
 def watchdog_stalled(state: dict):

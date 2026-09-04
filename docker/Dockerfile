@@ -61,15 +61,26 @@ RUN pip install --index-url ${TORCH_INDEX} torch==2.5.1 torchvision==0.20.1 torc
 # the tracked-file fixes rsv4 depends on: mc_algo='mc' (no diso/nvcc needed), Windows-safe
 # temp files, HONEST /status (a crashed worker says 'error', an unknown uid is a 404, never
 # 'processing' forever), a single-flight bounded /send queue (429 + Retry-After when full),
-# parameter validation (400 naming the field), --subfolder selection, and the degenerate-octree
-# guard. Source of truth: ../patches. Applied AFTER pip so a patch change reuses the pip cache.
+# parameter validation (400 naming the field), the degenerate-octree guard, and (2026-09-04)
+# MULTI-MODEL serving: one worker holds the single-view dit, both multiview dits and Zero123-XL,
+# chosen per request ({image} / {views} / "model"), loaded lazily and evicted LRU by VRAM, plus
+# POST /imagine on the same queue. Source of truth: ../patches. Applied AFTER pip so a patch
+# change reuses the pip cache.
 COPY patches/rsv4-stack.patch /tmp/rsv4-stack.patch
 RUN git -C /app apply --verbose /tmp/rsv4-stack.patch
 
-# the front door (bearer auth + health, stdlib-only) and the two-process entry
+# the front door (bearer auth + health, stdlib-only), the model catalog and the two-process entry.
+# hy3d_models.py is the ONE holder of "which repo/subfolder/files is model X": api_server.py
+# imports it for model selection + /ping's model list, start.sh shells out to its check/prefetch
+# CLI for the offline decision - never two mappings that can drift apart.
 COPY docker/auth_gate.py /app/auth_gate.py
+COPY docker/hy3d_models.py /app/hy3d_models.py
 COPY docker/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
+# Zero123-XL view synthesis (POST /imagine): the manual component loader plus the two files it
+# needs beside it - the diffusers-0.32.2 community pipeline (kxic/zero123-xl's own copy cannot be
+# resolved by this diffusers) and the torch-only kornia shim (kornia is deliberately NOT a pin).
+COPY docker/zero123/ /app/zero123/
 # the contract tests ride along (tiny, stdlib + the stack already here) so ANY host with the
 # image can prove the /send-/status-/queue contract with the pipeline stubbed, no GPU:
 #   docker run --rm --entrypoint python <image> /app/tests/harness.py --api-dir /app --log /tmp/h/harness.log

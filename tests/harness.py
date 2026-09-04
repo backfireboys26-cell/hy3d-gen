@@ -66,6 +66,9 @@ os.makedirs(os.path.dirname(LOG), exist_ok=True)
 os.chdir(os.path.dirname(LOG))
 sys.path.insert(0, REPO)
 sys.path.insert(0, API_DIR)
+# hy3d_models.py (the served-model catalog api_server imports) sits beside auth_gate.py: in
+# /app inside the image, in <vault>/engine/generation/docker in this tree
+sys.path.insert(0, os.path.dirname(GATE_PY))
 # the harness fixes the knobs it depends on; the hang case lowers JOB_MAX_S at runtime
 os.environ["HY3D_QUEUE_MAX"] = "4"
 os.environ["HY3D_JOB_ETA_S"] = "7"
@@ -112,6 +115,10 @@ class SlowMesh:
 
 
 class StubWorker:
+    def __init__(self):
+        self.seen = []                      # (kind, model, view slots) per job, for case Q/R
+        self.resident = ["stub-resident"]   # what /queue + /ping report as 'loaded'
+
     def generate(self, uid, params):
         seed = params.get("seed")
         if seed == CRASH_SEED:
@@ -134,8 +141,22 @@ class StubWorker:
                 f.write(SLOW_RESULT[len(SLOW_RESULT) // 2:])
             return
         time.sleep(GEN_S)
+        self.seen.append(("mesh", params.get("model"), sorted(params.get("views") or {})))
         with open(os.path.join(s.SAVE_DIR, f"{uid}.glb"), "wb") as f:
             f.write(b"glTF-stub-" + str(uid).encode())
+
+    def imagine(self, uid, params):
+        """The /imagine half of the worker: the SAME atomic publish, a tiny PNG per view."""
+        time.sleep(GEN_S / 3)
+        self.seen.append(("views", params.get("model"), sorted(params["views"])))
+        views = {v: base64.b64encode(STUB_PNG + v.encode()).decode() for v in params["views"]}
+        result = {"kind": "views", "model": params["model"], "views": views, "size": params["size"],
+                  "steps": params["steps"], "guidance_scale": params["guidance_scale"],
+                  "seed": params["seed"], "elevation": params["elevation"], "seconds": 0.1}
+        s.publish_bytes(json.dumps(result).encode(), uid, "json")
+
+    def loaded(self):
+        return list(self.resident)
 
 
 def serve(port):
@@ -198,7 +219,9 @@ def raw_http(sock, request_bytes):
     return head, rest[:n]
 
 
-IMG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\0" * 64).decode()
+STUB_PNG = b"\x89PNG\r\n\x1a\n"
+IMG = base64.b64encode(STUB_PNG + b"\0" * 64).decode()
+VIEWS = {"front": IMG, "left": IMG, "right": IMG}
 good = {"image": IMG, "octree_resolution": 128, "num_inference_steps": 5, "guidance_scale": 5.0,
         "seed": 1, "unknown_field": "ignored"}
 
@@ -220,6 +243,28 @@ if args.hang_child:
     print("[hang-child] STILL ALIVE after 60 s - the watchdog did not exit", flush=True)
     os._exit(99)
 
+# PREFLIGHT (2026-09-04): a harness run that dies before its teardown leaves its gates bound to
+# these ports. The next run's gates then fail to bind and DIE, the STALE ones answer instead - with
+# the previous run's token - and every token case reads 401 while the open-gate cases still pass:
+# a 5-case phantom failure that looks like a gate bug. A port already listening is fatal here, with
+# the pids to kill, before a single case runs.
+busy = None if args.hang_child else []
+for name, port in [] if busy is None else (("upstream", UP_PORT), ("open gate", GATE_PORT), ("token gate", TOK_PORT),
+                   ("small-inline gate", SGATE_PORT)):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        busy.append(f"{name} :{port}")
+    except OSError:
+        pass
+if busy:
+    sys.__stdout__.write(
+        f"[harness] FATAL: {', '.join(busy)} already listening - a stale harness gate would answer "
+        f"with the WRONG token and fail the token cases for the wrong reason. Kill it first "
+        f"(Windows: Get-NetTCPConnection -State Listen -LocalPort {UP_PORT},{GATE_PORT},{TOK_PORT},"
+        f"{SGATE_PORT} | Select LocalPort,OwningProcess).\n")
+    sys.__stdout__.flush()
+    os._exit(2)
+
 s.worker = StubWorker()
 gen_thread = s.start_generation_loop()
 serve(UP_PORT)
@@ -237,6 +282,14 @@ tgate = subprocess.Popen([sys.executable, GATE_PY], env=dict(base_env, PORT=str(
 # a gate whose inline cap is tiny, so every stub result goes through the latch-for-ranged-download path
 sgate = subprocess.Popen([sys.executable, GATE_PY], env=dict(base_env, PORT=str(SGATE_PORT), STATUS_INLINE_MAX="64"),
                          stdout=gate_log, stderr=subprocess.STDOUT)
+
+for name, proc in (("open gate", gate), ("token gate", tgate), ("small-inline gate", sgate)):
+    time.sleep(0.2)
+    if proc.poll() is not None:
+        sys.__stdout__.write(f"[harness] FATAL: the {name} process exited with {proc.returncode} "
+                             f"before any case ran - see {LOG}.gate.txt\n")
+        sys.__stdout__.flush()
+        os._exit(2)
 
 out = open(LOG, "w", encoding="utf-8")
 results = []
@@ -439,6 +492,163 @@ c, h, b = req("GET", f"/result/{uid}?offset=5&length=4")
 check("I /result chunk carries size/sha/offset headers and the right bytes",
       c == 200 and h.get("x-result-offset") == "5" and h.get("x-result-size") and h.get("x-result-sha256")
       and b.get("_raw") == b"stub", f"-> {c} off={h.get('x-result-offset')} {b}")
+
+# --- Q. MODEL SELECTION (2026-09-04): one worker, three shape models, chosen per request ---
+served = list(s.SERVED)
+check("Q the worker serves the single-view dit, both multiview dits and zero123-xl",
+      served == ["hunyuan3d-dit-v2-mini-turbo", "hunyuan3d-dit-v2-0", "hunyuan3d-dit-v2-mv",
+                 "hunyuan3d-dit-v2-mv-turbo", "zero123-xl"], f"{served}")
+check("Q the defaults route a body without 'model': image -> the single dit, views -> the NON-turbo mv, imagine -> zero123",
+      s.DEFAULTS == {"image": "hunyuan3d-dit-v2-mini-turbo", "views": "hunyuan3d-dit-v2-mv",
+                     "imagine": "zero123-xl"}, f"{s.DEFAULTS}")
+c, h, b = req("POST", "/send", {"views": VIEWS, "seed": 11, "octree_resolution": 128})
+check("Q a {views} body is accepted and defaults to the multiview model",
+      c == 200 and b.get("model") == "hunyuan3d-dit-v2-mv" and b.get("kind") == "mesh", f"-> {c} {b}")
+mv_uid = b.get("uid")
+c, h, b = req("POST", "/send", {"views": VIEWS, "model": "dit-v2-mv-turbo", "seed": 12})
+check("Q model 'dit-v2-mv-turbo' (a short alias) selects the turbo multiview dit",
+      c == 200 and b.get("model") == "hunyuan3d-dit-v2-mv-turbo", f"-> {c} {b}")
+turbo_uid = b.get("uid")
+c, h, b = req("POST", "/send", {**good, "model": "dit-v2-0", "seed": 13})
+check("Q an {image} body with model 'dit-v2-0' selects the full single-view dit",
+      c == 200 and b.get("model") == "hunyuan3d-dit-v2-0", f"-> {c} {b}")
+single_uid = b.get("uid")
+c, h, b = req("POST", "/send", {**good, "model": "dit-v2-mv", "seed": 14})
+check("Q an {image} body on a multiview model is accepted (the image fills the front slot)",
+      c == 200 and b.get("model") == "hunyuan3d-dit-v2-mv", f"-> {c} {b}")
+front_uid = b.get("uid")
+for body, field, needle in [
+    ({"views": VIEWS, "model": "dit-v2-0"}, "model", "no view slots"),
+    ({"views": VIEWS, "model": "zero123-xl"}, "model", "POST /imagine"),
+    ({**good, "model": "dit-v2-99"}, "model", "unknown"),
+    ({**good, "model": 7}, "model", "must be a string"),
+    ({**good, "views": VIEWS}, "views", "not both"),
+    ({"views": {"top": IMG}}, "views", "unknown view"),
+    ({"views": {}}, "views", "non-empty object"),
+    ({"views": {"front": ""}}, "views", "non-empty base64"),
+    ({"views": [IMG]}, "views", "non-empty object"),
+]:
+    c, h, b = req("POST", "/send", body)
+    check(f"Q 400 for {field}: {needle}",
+          c == 400 and b.get("field") == field and needle in b.get("error", ""), f"-> {c} {b}")
+for uid_, what in [(mv_uid, "views/mv"), (turbo_uid, "views/mv-turbo"),
+                   (single_uid, "image/dit-v2-0"), (front_uid, "image/mv")]:
+    c, b = wait_terminal(uid_, 60)
+    check(f"Q the {what} job completed", b.get("status") == "completed", f"{b.get('status')} {b.get('error')}")
+seen4 = [x for x in s.worker.seen if x[0] == "mesh"][-4:]
+check("Q each job reached the worker under the model it named, with the slots it sent "
+      "(an {image} body on the mv model arrives as the FRONT slot alone)",
+      seen4 == [("mesh", "hunyuan3d-dit-v2-mv", ["front", "left", "right"]),
+                ("mesh", "hunyuan3d-dit-v2-mv-turbo", ["front", "left", "right"]),
+                ("mesh", "hunyuan3d-dit-v2-0", []),
+                ("mesh", "hunyuan3d-dit-v2-mv", ["front"])], f"{seen4}")
+wait_drain(60)
+
+# --- R. POST /imagine (Zero123-XL view synthesis) on the SAME queue, clamps and record ---
+c, h, b = req("POST", "/imagine", {"image": IMG, "views": ["left", "right", "back"], "size": 256, "steps": 75})
+check("R /imagine accepted: uid + kind 'views' + the zero123 model",
+      c == 200 and b.get("uid") and b.get("kind") == "views" and b.get("model") == "zero123-xl", f"-> {c} {b}")
+im_uid = b.get("uid")
+c, h, b = req("GET", f"/status/{im_uid}")
+check("R /status of a queued/processing /imagine job says so, tagged kind 'views'",
+      c == 200 and b.get("status") in ("queued", "processing") and b.get("kind") == "views", f"-> {c} {b}")
+c, b = wait_terminal(im_uid, 40)
+vs = b.get("views") or {}
+check("R /status -> completed with the three requested views as base64 PNGs",
+      b.get("status") == "completed" and sorted(vs) == ["back", "left", "right"]
+      and all(base64.b64decode(v).startswith(STUB_PNG) for v in vs.values())
+      and b.get("size") == 256 and b.get("steps") == 75 and b.get("model") == "zero123-xl",
+      f"views={sorted(vs)} size={b.get('size')} steps={b.get('steps')} status={b.get('status')}")
+c, h, b = req("POST", "/imagine", {"image": IMG, "views": ["left"], "size": 128, "steps": 4, "seed": 5})
+im2 = b.get("uid")
+c, b = wait_terminal(im2, 40)
+check("R a single-view /imagine at another size/steps/seed round-trips those fields",
+      b.get("status") == "completed" and sorted(b.get("views") or {}) == ["left"]
+      and b.get("size") == 128 and b.get("steps") == 4 and b.get("seed") == 5,
+      f"status={b.get('status')} size={b.get('size')} steps={b.get('steps')} seed={b.get('seed')}")
+for body, field, needle in [
+    ({"views": ["left"]}, "image", "required"),
+    ({"image": IMG, "views": ["top"]}, "views", "unknown view"),
+    ({"image": IMG, "views": []}, "views", "non-empty list"),
+    ({"image": IMG, "views": "left"}, "views", "non-empty list"),
+    ({"image": IMG, "size": 100}, "size", "multiple of 8"),
+    ({"image": IMG, "size": 4096}, "size", "within"),
+    ({"image": IMG, "steps": 0}, "steps", "within"),
+    ({"image": IMG, "steps": "x"}, "steps", "must be an integer"),
+    ({"image": IMG, "elevation": 900}, "elevation", "within"),
+    ({"image": IMG, "model": "dit-v2-0"}, "model", "POST /send"),
+    ({"image": IMG, "model": "nope"}, "model", "unknown"),
+    ([1, 2], "body", "JSON object"),
+]:
+    c, h, b = req("POST", "/imagine", body)
+    check(f"R 400 for {field}: {needle}",
+          c == 400 and b.get("field") == field and needle in b.get("error", ""), f"-> {c} {b}")
+c, h, b = req("POST", "/imagine", b"{nope")
+check("R 400 for invalid JSON on /imagine", c == 400 and b.get("field") == "body", f"-> {c} {b}")
+# /imagine shares the ONE single-flight queue with /send: fill it, then /imagine must 429
+fill = [req("POST", "/send", {**good, "seed": 200 + i})[0] for i in range(5)]
+c, h, b = req("POST", "/imagine", {"image": IMG, "views": ["back"]})
+check("R /imagine rides the SAME single-flight queue: 429 + Retry-After once /send filled it",
+      fill == [200] * 5 and c == 429 and (h.get("retry-after") or "").isdigit() and b.get("status") == "busy",
+      f"fill={fill} -> {c} Retry-After={h.get('retry-after')}")
+check("R the /imagine job reached the worker as a views job with its slots",
+      ("views", "zero123-xl", ["back", "left", "right"]) in s.worker.seen,
+      f"{[x for x in s.worker.seen if x[0] == 'views']}")
+wait_drain(60)
+
+# --- S. /ping and /queue NAME every served model (the client picks its model and ladder from it) ---
+c, h, b = req("GET", "/ping")
+check("S /ping lists every served model and the ones resident right now",
+      c == 200 and b.get("status") == "ok" and b.get("models") == served and b.get("loaded") == ["stub-resident"],
+      f"models={b.get('models')} loaded={b.get('loaded')}")
+check("S /ping keeps 'model' + 'subfolder' naming the served repos/subfolders (the 2026-09-03 client reads exactly these)",
+      "tencent/Hunyuan3D-2mv" in (b.get("model") or "") and "hunyuan3d-dit-v2-mv" in (b.get("subfolder") or ""),
+      f"model={b.get('model')!r} subfolder={b.get('subfolder')!r}")
+_MV_ID_RE = re.compile(r"(^|[-_/])2?mv([-_/]|$)")
+check("S both /ping name-fields pass generate3d.py's POSITIVE multiview guard (an 'mv' token, no contradiction)",
+      bool(_MV_ID_RE.search((b.get("model") or "").lower())) and bool(_MV_ID_RE.search((b.get("subfolder") or "").lower())),
+      f"model={b.get('model')!r} subfolder={b.get('subfolder')!r}")
+check("S the subfolder list ends with a NON-turbo dit, so the client's step ladder defaults to quality",
+      not (b.get("subfolder") or "").endswith("-turbo"), f"subfolder={b.get('subfolder')!r}")
+q = req("GET", "/queue")[2]
+check("S /queue carries the same model state beside the health fields",
+      q.get("models") == served and q.get("loaded") == ["stub-resident"] and isinstance(q.get("defaults"), dict),
+      f"models={q.get('models')} loaded={q.get('loaded')}")
+
+# --- T. residency: pipelines stay loaded, the LRU one is evicted when a load will not fit ---
+try:
+    import collections
+    w = object.__new__(s.ModelWorker)           # no rembg/u2net download in a contract test
+    w.device, w.pipelines, w.lock = "cuda", collections.OrderedDict(), threading.RLock()
+    w._load = lambda name: f"pipe:{name}"
+    # free VRAM RESPONDS to residency (~5.4 GB of weights each), so an eviction really frees room
+    # and the loop is measured, not asserted: a fixed number would either never evict or evict
+    # everything regardless of the rule.
+    card = [24576.0]
+    w._free_mb = lambda: (card[0] - 5400.0 * len(w.pipelines), card[0])
+    for n in ("hunyuan3d-dit-v2-0", "hunyuan3d-dit-v2-mv", "hunyuan3d-dit-v2-mv-turbo"):
+        w.ensure(n)
+    check("T the three shape models stay resident TOGETHER on a 24 GB card (~16 GB of weights)",
+          w.loaded() == ["hunyuan3d-dit-v2-0", "hunyuan3d-dit-v2-mv", "hunyuan3d-dit-v2-mv-turbo"], f"{w.loaded()}")
+    w.ensure("hunyuan3d-dit-v2-0")              # touch: it becomes the most recently used
+    check("T ensure() on a resident model returns it without reloading and refreshes its LRU position",
+          w.loaded() == ["hunyuan3d-dit-v2-mv", "hunyuan3d-dit-v2-mv-turbo", "hunyuan3d-dit-v2-0"], f"{w.loaded()}")
+    w.ensure("zero123-xl")
+    check("T zero123 joins them - a fourth model that still fits is NOT an eviction",
+          w.loaded() == ["hunyuan3d-dit-v2-mv", "hunyuan3d-dit-v2-mv-turbo", "hunyuan3d-dit-v2-0", "zero123-xl"],
+          f"{w.loaded()}")
+    w.ensure("hunyuan3d-dit-v2-mini-turbo")     # a fifth: HY3D_MAX_LOADED is 4
+    check(f"T a fifth model past HY3D_MAX_LOADED ({s.MAX_LOADED}) evicts the LEAST recently used one only",
+          w.loaded() == ["hunyuan3d-dit-v2-mv-turbo", "hunyuan3d-dit-v2-0", "zero123-xl",
+                         "hunyuan3d-dit-v2-mini-turbo"], f"{w.loaded()}")
+    card[0] = 8192.0                             # an 8 GB Pascal: one 5.4 GB dit + 2 GB margin fills it
+    w.pipelines.clear()
+    w.ensure("hunyuan3d-dit-v2-0")
+    w.ensure("hunyuan3d-dit-v2-mv")
+    check("T on an 8 GB card the SAME rule holds one model at a time (VRAM, not the count, evicts)",
+          w.loaded() == ["hunyuan3d-dit-v2-mv"], f"{w.loaded()}")
+except Exception as e:
+    check("T the worker keeps loaded pipelines resident and evicts LRU", False, repr(e))
 
 # --- O. a slow result export (verifier P2): atomic publish, record-first /status, no partial latch ---
 
