@@ -19,7 +19,8 @@ Usage: python probe_real.py <base_url> <image.png> <log_path> [--mode full|wedge
      GET /ping -> 200 and a tokened POST /send -> 200 (the gate drained the 401's body).
      /queue carries watchdog_alive:true + watchdog_age_s (<= 3 ticks) + watchdog_tick_s.
   8. (round 3) --big-octree N (default 0 = skip): one job at octree N / 5 steps, polled every
-     0.25 s from 'processing' to the end; the FIRST 'completed' must carry a GLB whose header
+     --big-poll-s seconds (default 0.25; the 2026-09-04 GPU runs used 0.05) from 'processing'
+     to the end; the FIRST 'completed' must carry a GLB whose header
      length (bytes 8..12) equals the byte count, whose size/sha256 fields match, and whose
      sha is stable on the next polls - /status never said 'completed' on a partial file.
 --mode wedge: the container was started with a tiny HY3D_JOB_MAX_S (e.g. 20) and a long
@@ -56,6 +57,7 @@ ap.add_argument("--token", default=os.environ.get("HY3D_PROBE_TOKEN") or None,
                 help="X-HY3D-Token for a gate started with HY3D_TOKEN (env HY3D_PROBE_TOKEN); never logged")
 ap.add_argument("--big-octree", type=int, default=0, help="round-3 slow-export case: octree for one 5-step job (0 = skip)")
 ap.add_argument("--big-budget-s", type=int, default=3600, help="wall budget for the --big-octree job")
+ap.add_argument("--big-poll-s", type=float, default=0.25, help="/status poll interval for the --big-octree job (s)")
 a = ap.parse_args()
 BASE, LOG = a.base.rstrip("/"), a.log
 TOKEN = a.token
@@ -352,9 +354,9 @@ if a.big_octree:
         if st in ("completed", "error") or code != 200:
             first_done = (time.time() - t0, code, js)
             break
-        time.sleep(0.25)
+        time.sleep(a.big_poll_s)
     check("big-octree job reached a terminal state within the budget", first_done is not None,
-          f"{polls} polls in {time.time() - t0:.0f}s; transitions {states}")
+          f"{polls} polls at {a.big_poll_s}s in {time.time() - t0:.0f}s; transitions {states}")
     if first_done:
         took, code, js = first_done
         if js.get("status") == "completed":
